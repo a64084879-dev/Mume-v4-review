@@ -1,0 +1,50 @@
+# .github/workflows/mume_v4.yml — 무매 V4 제안봇 (완전 독립 리포용)
+# 미국장 마감 후 KST 07:30에 실행 (UTC 22:30, 월~금 = 미국 월~금 장 커버)
+name: mume-v4-signal
+
+on:
+  schedule:
+    - cron: "30 22 * * 1-5"      # KST 07:30 — 정산+주문표 제안
+    - cron: "30 07 * * 1-5"      # KST 16:30 — /ok 수거 후 제출(승인 시)
+  workflow_dispatch: {}        # 수동 실행 버튼
+
+permissions:
+  contents: write              # state 커밋용
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install deps
+        run: pip install yfinance requests
+
+      - name: Run bot
+        env:
+          MUME_TG_TOKEN: ${{ secrets.MUME_TG_TOKEN }}
+          MUME_TG_CHAT:  ${{ secrets.MUME_TG_CHAT }}
+          MUME_TICKER:   TQQQ        # TQQQ / SOXL
+          MUME_SPLIT:    "40"        # 20 / 40
+          MUME_SEED:     "20000"     # 최초 부트스트랩 시드(이후 state가 우선)
+          # ── 브로커 연결(선택). 미설정 시 종가 추정+수동 주문 모드 ──
+          # 계좌 분담(경우 C): 인스턴스마다 브로커 하나 고정. 상태파일도 분리.
+          MUME_BROKER:   ""          # kis(연습) | toss(승인후) | kiwoom(TR확정후)
+          MUME_KIS_APPKEY: ${{ secrets.MUME_KIS_APPKEY }}
+          MUME_KIS_SECRET: ${{ secrets.MUME_KIS_SECRET }}
+          MUME_KIS_CANO:   ${{ secrets.MUME_KIS_CANO }}
+          MUME_KIS_MOCK:   "1"       # 1=모의(연습) 0=실전
+          MUME_ALLOW_MOCK_LOC: "0"   # 모의 LOC 폴백 연습 허용(실전 절대 금지)
+        run: python mume_v4_bot.py
+
+      - name: Commit state
+        run: |
+          git config user.name  "mume-bot"
+          git config user.email "bot@local"
+          git add mume_state.json
+          git diff --cached --quiet || git commit -m "state $(date -u +%F)"
+          git push
