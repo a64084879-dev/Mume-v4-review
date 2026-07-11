@@ -603,14 +603,13 @@ def rv_series(closes, lookback=VOLTGT_LOOKBACK):
     return closes.pct_change().rolling(lookback).std() * np.sqrt(252)
 
 def _scale_orders(orders, scale):
+    # B: 진행매수(star/avg)만 scale. first_big 면제(A와 통일), extra·매도 무영향(중복 제거).
     out=[]
     for o in orders:
-        if o.side=="buy" and o.role in ("first_big","star_buy","avg_buy"):
+        if o.side=="buy" and o.role in ("star_buy","avg_buy"):
             q=int(o.qty*scale)
             if q>0: out.append(Order(o.side,o.kind,o.price,q,o.tag,role=o.role))
         else: out.append(o)
-    for o in orders:
-        if o.role=="extra_buy": out.append(o)
     return out
 
 def run_voltgt(df, mode="PURE", ticker=None, split=None, seed=None, compound=None, fee=None, warmup=None):
@@ -629,8 +628,9 @@ def run_voltgt(df, mode="PURE", ticker=None, split=None, seed=None, compound=Non
             if len(st.closes)>=5: st.close5_avg=_round2(sum(st.closes[-5:])/5)
             nav_series.append(st.balance); nav_low.append(st.balance); continue
         scale=1.0
-        if mode in ("A","B") and not np.isnan(rv[i]) and rv[i]>0:
-            scale=min(1.0, VOLTGT_TARGET/rv[i])
+        rv_use = rv[i-1] if i>=1 else float('nan')   # look-ahead 제거: 전일 rv로 당일 주문(봇 정합)
+        if mode in ("A","B") and not np.isnan(rv_use) and rv_use>0:
+            scale=min(1.0, VOLTGT_TARGET/rv_use)
         if mode=="A" and scale<1.0:
             rb=st.balance; st.balance=rb*scale
             orders=suggest_orders(st) if st.prev_close is not None else []
