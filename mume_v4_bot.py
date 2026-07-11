@@ -27,7 +27,7 @@ import os, sys, json, datetime, hashlib
 from typing import List, Optional
 import requests
 
-from mume_v4_core import State, Order, suggest_orders, star_price, star_pct, unit_amount, is_first_half
+from mume_v4_core import State, Order, suggest_orders, star_price, star_pct, unit_amount, is_first_half, _round2
 from mume_v4_state import Fill, update_state, start_new_cycle
 try:
     from mume_v4_broker import load_adapter, reconcile, submit_orders, loc_submit_allowed
@@ -66,7 +66,7 @@ def to_State(d: dict) -> State:
     return State(d["ticker"], d["split"], d["seed"], d["balance"], d["shares"],
                  d["avg"], d["T"], mode=d["mode"], rev_first=d["rev_first"],
                  prev_close=(d["closes"][-1] if d["closes"] else None),
-                 close5_avg=(round(sum(d["closes"][-5:]) / 5, 2) if len(d["closes"]) >= 5 else None),
+                 close5_avg=(_round2(sum(d["closes"][-5:]) / 5) if len(d["closes"]) >= 5 else None),
                  closes=list(d["closes"]))
 
 def from_State(st: State, d: dict):
@@ -120,8 +120,24 @@ def tg_send(text: str):
     if DRY_RUN or not TG_TOKEN:
         print("─" * 46 + "\n[텔레그램 발송(DRY)]\n" + text + "\n" + "─" * 46)
         return
-    requests.post(f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage",
-                  json={"chat_id": TG_CHAT, "text": text}, timeout=20)
+    # 텔레그램 한도 4096자 — 줄 단위 분할 발송 + 실패 체크
+    chunks, cur = [], ""
+    for line in text.split("\n"):
+        if len(cur) + len(line) + 1 > 3900:
+            chunks.append(cur); cur = line
+        else:
+            cur = (cur + "\n" + line) if cur else line
+    chunks.append(cur)
+    for i, ch in enumerate(chunks):
+        try:
+            r = requests.post(f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage",
+                              json={"chat_id": TG_CHAT,
+                                    "text": ch if len(chunks) == 1 else f"({i+1}/{len(chunks)})\n{ch}"},
+                              timeout=20)
+            if r.status_code != 200:
+                print(f"[tg_send 실패 {r.status_code}] {r.text[:120]}")
+        except Exception as e:
+            print(f"[tg_send 예외] {e}")
 
 def tg_poll(offset: int):
     """미처리 명령 수거. 반환: (texts, new_offset)."""
@@ -283,6 +299,8 @@ def run_daily(mock_ohlc=None):
         from_State(st, d)
         d["last_date"] = new_days[-1][0]
         d["pending_orders"] = []
+        if d.get("approved_date") and not d.get("submitted"):
+            lines.append("ℹ 직전 승인(/ok)은 제출되지 않은 채 만료됨 — 오늘 주문표 확인 후 다시 /ok")
         d["approved_date"] = None; d["submitted"] = {}   # 새 거래일 → 승인·제출 기록 리셋
 
     # ④ 오늘의 주문 제안
