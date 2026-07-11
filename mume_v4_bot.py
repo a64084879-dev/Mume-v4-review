@@ -42,6 +42,10 @@ STATE_FILE = os.environ.get("MUME_STATE", "mume_state.json")
 TG_TOKEN = os.environ.get("MUME_TG_TOKEN", "")
 TG_CHAT  = os.environ.get("MUME_TG_CHAT", "")
 DRY_RUN  = os.environ.get("MUME_DRY", "0") == "1"          # 1=발송 대신 stdout
+# VOLTGT A (백테스트로 8개 시작일 전부 MDD·샤프 개선 확인 → 채택)
+VOLTGT_ON     = os.environ.get("MUME_VOLTGT", "1") == "1"   # 1=켬(기본)
+VOLTGT_TARGET = float(os.environ.get("MUME_VOLTGT_TARGET", "0.60"))
+VOLTGT_LOOKBACK = int(os.environ.get("MUME_VOLTGT_LOOKBACK", "20"))
 KST = datetime.timezone(datetime.timedelta(hours=9))
 
 # ══════════════ 상태 저장/복원 ══════════════
@@ -72,11 +76,26 @@ def to_State(d: dict) -> State:
 def from_State(st: State, d: dict):
     d.update({"seed": st.seed, "balance": st.balance, "shares": st.shares,
               "avg": st.avg, "T": st.T, "mode": st.mode, "rev_first": st.rev_first,
-              "closes": list(st.closes or [])[-10:]})
+              "closes": list(st.closes or [])[-30:]})
 
 def _ohash(orders_json: list) -> str:
     """주문표 스냅샷 해시 — /ok 승인 시점과 제출 시점의 주문표 동일성 보장."""
     return hashlib.md5(json.dumps(orders_json, sort_keys=True).encode()).hexdigest()[:12]
+
+def voltgt_scale(closes: list) -> float:
+    """VOLTGT A: RV = 최근 LOOKBACK일 수익률 std × √252 (실 TQQQ 가격 기준).
+    scale = min(1, TARGET/RV). 변동성 높을 때 1회매수금 축소. 데이터 부족 시 1.0."""
+    if not VOLTGT_ON or len(closes) < VOLTGT_LOOKBACK + 1:
+        return 1.0
+    import math
+    px = closes[-(VOLTGT_LOOKBACK + 1):]
+    rets = [(px[i] / px[i - 1] - 1.0) for i in range(1, len(px))]
+    m = sum(rets) / len(rets)
+    var = sum((r - m) ** 2 for r in rets) / (len(rets) - 1)
+    rv = math.sqrt(var) * math.sqrt(252)
+    if rv <= 0:
+        return 1.0
+    return min(1.0, VOLTGT_TARGET / rv)
 
 def orders_to_json(orders: List[Order]) -> list:
     return [{"side": o.side, "kind": o.kind, "price": o.price, "qty": o.qty,
@@ -239,7 +258,7 @@ def run_daily(mock_ohlc=None):
     if d["last_date"] is None and new_days:
         # 최초 부트스트랩: 종가 이력만 적재(체결 추정 없음)
         for r in new_days:
-            d["closes"] = (d["closes"] + [r[4]])[-10:]
+            d["closes"] = (d["closes"] + [r[4]])[-30:]
         d["last_date"] = new_days[-1][0]
         lines.append(f"── 부트스트랩: 종가 이력 {len(new_days)}일 적재 (최근 ${new_days[-1][4]:.2f})")
     elif new_days:
@@ -311,11 +330,20 @@ def run_daily(mock_ohlc=None):
     elif d.get("await_restart"):
         lines.append("🔔 사이클 종료 상태 — /restart <새시드> 로 재시작 (복리=잔금 전액, 단리=기존 시드)")
     else:
-        orders = suggest_orders(st)
+        # VOLTGT A: 변동성 높으면 1회매수금 축소(balance 임시 축소로 unit↓). 백테스터 A와 동일.
+        scale = voltgt_scale(st.closes or [])
+        if scale < 1.0:
+            real_bal = st.balance
+            st.balance = _round2(real_bal * scale)
+            orders = suggest_orders(st)
+            st.balance = real_bal
+        else:
+            orders = suggest_orders(st)
         oj = orders_to_json(orders)
         d["pending_orders"] = oj
         d["pending_hash"] = _ohash(oj)
-        lines += ["── 오늘의 주문 제안 (LOC 예약 / 지정가는 프리장부터)", fmt_orders(orders)]
+        vtag = f" · VOLTGT scale {scale:.2f}(RV↑ 매수축소)" if scale < 1.0 else ""
+        lines += ["── 오늘의 주문 제안 (LOC 예약 / 지정가는 프리장부터)" + vtag, fmt_orders(orders)]
         if st.mode == "reverse" and not st.rev_first and st.close5_avg is None:
             lines.append("⚠ 5일 종가 이력 부족 — 리버스 별지점 산출 불가(주문 없음). 다음 거래일 자동 해소.")
         today_kst = datetime.datetime.now(KST).strftime("%Y-%m-%d")
@@ -332,7 +360,7 @@ def run_daily(mock_ohlc=None):
             lines += ["── 주문 제출 결과"] + [" " + s for s in slogs]
         else:
             ok, why = loc_submit_allowed(adapter2)
-            lines.append(f"· 제출 대기 — 확인 후 /ok 로 승인 ({'제출가능: ' if ok else '⛔ '}{why})")
+            lines.append(f"· 제출 대기 — 확인 후 /ok 로 승인 (KST 23:35 제출 전까지) ({'제출가능: ' if ok else '⛔ '}{why})")
 
     tg_send("\n".join(lines))
     save_state(d)
