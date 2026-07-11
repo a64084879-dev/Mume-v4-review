@@ -94,6 +94,9 @@ def submit_orders(adapter: BrokerAdapter, symbol: str, orders: List[Order],
     if not ok:
         return already, [f"⛔ 제출 차단: {why}"]
     logs.append(f"제출 경로: {adapter.name} — {why}")
+    if adapter.name == "kis" and not bool(getattr(adapter, "use_reserve", False)):
+        logs.append("  ⚠ KIS 정규주문은 미국장 시간대만 접수 — 낮(16:30) 제출은 "
+                    "MUME_KIS_RESERVE=1(예약주문) 권장 또는 크론을 KST 22:00 이후로")
     # sanity: 매수 총액 ≤ 잔금×1.02 (수수료 여유)
     buy_total = sum((o.price or 0) * o.qty for o in orders if o.side == "buy")
     if buy_total > balance * 1.02:
@@ -140,18 +143,70 @@ def _match_role(f, pending: list, id_map: dict) -> str:
         return "extra_buy"                             # 1주 체결은 사다리일 확률 높음
     return c2[0]["role"] if len(c2) == 1 else "?"
 
+def match_fills(raw: list, pending: list, id_map: dict) -> Tuple[list, List[str]]:
+    """체결↔주문 role 매칭 (소비형). 반환 ([(fill, role)], 로그).
+    ①order_id ②단독 후보 소진 반복 ③잔여가 동수량 다중일 때: 체결 multiset ==
+      후보 multiset이면 세트 배정(role '집합'이 T를 결정하므로 순서 무관·안전) ④'?' 보류."""
+    logs: List[str] = []
+    remaining = [dict(p) for p in pending]
+    out = []; unresolved = []
+    def _cands(f):
+        if f.side == "sell":
+            cs=[p for p in remaining if p["side"]=="sell"]
+            tp=[p for p in cs if p["role"]=="tp_sell" and p.get("price")
+                and abs(f.price-p["price"])<0.011]
+            if tp: return tp
+            return [p for p in cs if p.get("price") and f.price>=p["price"]-0.011
+                    and (p.get("qty")==f.qty or True)]
+        return [p for p in remaining if p["side"]=="buy" and p.get("price")
+                and f.price<=p["price"]+0.011]
+    # ① order_id 확정
+    for f in raw:
+        role=None
+        for rec in id_map.values():
+            if isinstance(rec,dict) and rec.get("order_id")==f.order_id:
+                role=rec["role"]; break
+        if role:
+            out.append((f,role))
+            for p in remaining:
+                if p["role"]==role and p.get("qty")==f.qty:
+                    remaining.remove(p); break
+        else:
+            unresolved.append(f)
+    # ② 단독 후보 소진 반복
+    changed=True
+    while changed and unresolved:
+        changed=False
+        for f in list(unresolved):
+            cs=_cands(f)
+            exact=[p for p in cs if p.get("qty")==f.qty]
+            pick = exact[0] if len(exact)==1 else (cs[0] if len(cs)==1 else
+                   next((p for p in cs if p["role"]=="extra_buy"),None) if f.qty==1 else None)
+            if pick is not None:
+                out.append((f,pick["role"])); remaining.remove(pick)
+                unresolved.remove(f); changed=True
+    # ③ 동수량 세트 폴백: 잔여 체결·후보의 수량 multiset 일치 → 일괄 배정
+    if unresolved:
+        for side in ("buy","sell"):
+            fs=[f for f in unresolved if f.side==side]
+            cs=[p for p in remaining if p["side"]==side]
+            if fs and len(fs)==len(cs) and sorted(f.qty for f in fs)==sorted(p["qty"] for p in cs):
+                fs2=sorted(fs,key=lambda f:(f.qty,f.price)); cs2=sorted(cs,key=lambda p:(p["qty"],p["price"] or 0))
+                for f,p in zip(fs2,cs2):
+                    out.append((f,p["role"])); remaining.remove(p); unresolved.remove(f)
+                logs.append(f"  · 동수량 세트 매칭({side}) {len(fs2)}건 — role 집합 기준 T 안전")
+    for f in unresolved:
+        logs.append(f"  ⚠ role 모호: {f.side} {f.qty}주 @${f.price:.2f} — 반영 보류, /set 확인 요망")
+    return out, logs
+
 def reconcile(adapter: BrokerAdapter, symbol: str, pending: list,
               id_map: dict, since: str) -> Tuple[List[MFill], Position, float, List[str]]:
     """전일 실체결 조회→role 매칭 + 잔고 조회. 반환 (mume체결, 증권사포지션, 예수금, 로그)."""
-    logs: List[str] = []
     adapter.authenticate()
     raw = adapter.get_fills(symbol, since)
+    matched, logs = match_fills(raw, pending, id_map)
     fills: List[MFill] = []
-    for f in raw:
-        role = _match_role(f, pending, id_map)
-        if role == "?":
-            logs.append(f"  ⚠ role 모호: {f.side} {f.qty}주 @${f.price:.2f} — 반영 보류, /set 확인 요망")
-            continue
+    for f, role in matched:
         fills.append(MFill(role, f.price, int(f.qty)))
         logs.append(f"  · {role}: {f.qty}주 @${f.price:.2f} (수수료 ${f.fee:.2f})")
     pos = adapter.get_holdings(symbol)
