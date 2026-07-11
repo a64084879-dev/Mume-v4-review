@@ -26,12 +26,15 @@ TAX_RATE    = 0.22         # 양도세 (세전 확인은 0.0)
 TAX_DEDUCT  = 1850.0       # 연 공제
 FIRST_PREMIUM = 0.12       # 처음매수 프리미엄
 INTRADAY_MDD  = True       # 장중MDD(저가반영)
+CLOSES_KEEP   = 30         # 종가 이력 보관수(VOLTGT RV용)
 # 다중 시작일(2010 이후만 유효). []=단일 실행
 START_DATES = ["2010-02-11","2013-01-02","2016-01-02","2018-01-02",
                "2020-01-02","2021-01-02","2022-01-02","2024-01-02"]
 RUN_VOLTGT = True          # VOLTGT 실험: 순수무매 vs A(unit축소·T지연) vs B(수량만축소)
 VOLTGT_TARGET = 0.60       # 목표변동성
 VOLTGT_LOOKBACK = 20       # RV 룩백
+RUN_KILLSWITCH = True      # 킬스위치·B1 실험 (은박사: "킬스위치는 폭탄" — 데이터로 확인)
+FRED_API_KEY = ""          # FRED API 키(M0용). 없으면 보간 폴백 사용
 
 # ═══ [코어] 주문계산 ═══
 # ══════════════ 종목·분할 설정 ══════════════
@@ -315,7 +318,7 @@ def update_state(st: State, fills: List[Fill], today_close: float) -> UpdateResu
     if not hasattr(st, "closes") or st.closes is None:
         st.closes = []
     st.closes.append(today_close)
-    st.closes = st.closes[-10:]
+    st.closes = st.closes[-CLOSES_KEEP:]
     if len(st.closes) >= 5:
         # 원글: 리버스 별지점 = '직전 5거래일 종가 평균' — 다음 세션 기준 최근 5개 종가.
         #   (bot.to_State와 동일 정의로 통일 — 이중 정의 제거)
@@ -413,7 +416,7 @@ def run_backtest(df: pd.DataFrame, ticker=TICKER, split=SPLIT, seed=SEED,
 
         # ── 워밍업: 첫 warmup일은 종가 이력만 적재(매수 안 함) ──
         if i < warmup:
-            st.closes = (st.closes + [close])[-10:]
+            st.closes = (st.closes + [close])[-CLOSES_KEEP:]
             st.prev_close = close
             if len(st.closes) >= 5:
                 st.close5_avg = _round2(sum(st.closes[-5:]) / 5)
@@ -624,7 +627,7 @@ def run_voltgt(df, mode="PURE", ticker=None, split=None, seed=None, compound=Non
     for i in range(n):
         close=float(cvals[i]); high=float(highs[i]); low=float(lows[i]); yr=dates[i].year
         if i<warmup:
-            st.closes=(st.closes+[close])[-10:]; st.prev_close=close
+            st.closes=(st.closes+[close])[-CLOSES_KEEP:]; st.prev_close=close
             if len(st.closes)>=5: st.close5_avg=_round2(sum(st.closes[-5:])/5)
             nav_series.append(st.balance); nav_low.append(st.balance); continue
         scale=1.0
@@ -719,6 +722,268 @@ def print_voltgt_multi(df_full, start_dates):
     print("  샤프 PURE 대비 오르면 위험조정수익 개선 = VOLTGT 채택 근거.")
     print("="*116)
 
+# ═══ [킬스위치·B1 오버레이] 지수(GSPC/M0) 신호 (core 무수정) ═══
+BUBBLE_LIMIT = 1.30; B1_WINDOW = 2520; B1_PCTL = 0.80
+
+def _fetch_fred_m0():
+    """M0(BOGMBASE) FRED 수집. 키 없으면 앵커 보간 폴백."""
+    import urllib.request, json as _json, datetime as _dt
+    if FRED_API_KEY:
+        try:
+            end=_dt.date.today().strftime("%Y-%m-%d")
+            url=(f"https://api.stlouisfed.org/fred/series/observations?series_id=BOGMBASE"
+                 f"&api_key={FRED_API_KEY}&file_type=json&observation_start=1985-01-01&observation_end={end}")
+            with urllib.request.urlopen(url,timeout=30) as r:
+                obs=_json.loads(r.read()).get("observations",[])
+            d=pd.DataFrame(obs); d["date"]=pd.to_datetime(d["date"])
+            d["value"]=pd.to_numeric(d["value"],errors="coerce")
+            return d.set_index("date")["value"].dropna()
+        except Exception as e:
+            print(f"  [M0] FRED 실패({e}) → 보간 폴백")
+    # 폴백: 역사적 M0 앵커(십억$) 보간
+    anc={1989:270.,1995:400.,2000:580.,2005:780.,2008:850.,2009:2050.,
+         2013:3600.,2017:3800.,2020:4800.,2022:5900.,2024:5600.,2026:5700.}
+    s=pd.Series(anc); s.index=pd.to_datetime([f"{y}-01-01" for y in s.index])
+    s=s.reindex(pd.date_range("1985-01-01","2026-12-31",freq="YS")).interpolate().ffill().bfill()
+    return s.resample("D").interpolate()
+
+def build_signals(gspc, m0, idx):
+    # SMA200은 GSPC native 거래일로 계산(휴장일 ffill 왜곡 방지, 봇과 정합).
+    gspc=gspc.dropna()
+    if m0.max()>100000: m0=m0/1000.0     # 단위 정규화(백만→십억)
+    m0g=m0.reindex(gspc.index).ffill().bfill()
+    sma200=gspc.rolling(200).mean(); bubble=gspc/m0g; above=gspc>sma200
+    evac_ks=(bubble>=BUBBLE_LIMIT)&(~above)
+    b1_th=bubble.rolling(B1_WINDOW,min_periods=252).quantile(B1_PCTL)
+    evac_b1=(bubble>=b1_th)&(~above)
+    out=pd.DataFrame({"evac_ks":evac_ks,"evac_b1":evac_b1,"above_sma200":above,"bubble":bubble})
+    # TQQQ 거래일(idx)에 맞춰 재색인(신호 사용 시)
+    return out.reindex(idx).ffill()
+
+def run_killswitch(df, sig, mode="PURE"):
+    cvals=df["Close"].values; highs=df["High"].values; lows=df["Low"].values
+    dates=list(df.index); n=len(df)
+    ev_ks=sig["evac_ks"].reindex(df.index).fillna(False).values
+    ev_b1=sig["evac_b1"].reindex(df.index).fillna(False).values
+    above=sig["above_sma200"].reindex(df.index).fillna(True).values
+    st=State(TICKER,SPLIT,SEED,SEED,0,0.0,0.0,prev_close=None,closes=[])
+    yr=defaultdict(float); rc=0.0; tc=0.0; nc=nr=0; nav=[]; nl=[]; pool=0.0
+    inv=0.0; act=idl=0; evd=0; kse=False; b1e=False
+    for i in range(n):
+        c=float(cvals[i]); h=float(highs[i]); l=float(lows[i]); y=dates[i].year
+        if i<WARMUP:
+            st.closes=(st.closes+[c])[-CLOSES_KEEP:]; st.prev_close=c
+            if len(st.closes)>=5: st.close5_avg=_round2(sum(st.closes[-5:])/5)
+            nav.append(st.balance); nl.append(st.balance); continue
+        j=i-1
+        kss=ev_ks[j] if mode in ("KS","KS_B1") else False
+        b1s=ev_b1[j] if mode in ("B1","KS_B1") else False
+        wks=kse
+        if kss: kse=True
+        elif above[j]: kse=False
+        if b1s: b1e=True
+        elif above[j]: b1e=False
+        if kse or b1e: evd+=1
+        if kse and not wks and st.shares>0:   # 킬스위치 전량청산
+            ab=st.avg; q=st.shares
+            rl=q*(c-ab)-c*q*FEE_RATE; yr[y]+=rl; rc+=rl
+            st.balance+=c*q*(1-FEE_RATE); nc+=1
+            if COMPOUND: start_new_cycle(st,st.balance)
+            else: pool+=(st.balance-SEED); start_new_cycle(st,SEED)
+        orders=suggest_orders(st) if st.prev_close is not None else []
+        if kse: orders=[]
+        elif b1e: orders=[o for o in orders if o.side=="sell"]
+        fills=judge_fills(orders,h,l,c)
+        ab=st.avg; rt=0.0
+        for f in fills:
+            if f.role in ("quarter_sell","tp_sell","rev_first_sell","rev_sell") and ab>0:
+                rt+=f.qty*(f.price-ab)
+            rt-=f.price*f.qty*FEE_RATE
+        yr[y]+=rt; rc+=rt
+        res=update_state(st,fills,c); st.balance-=sum(f.price*f.qty*FEE_RATE for f in fills)
+        for ev in res.events:
+            if "사이클종료" in ev: nc+=1
+            if "리버스전환" in ev: nr+=1
+        if any("사이클종료" in e for e in res.events):
+            if COMPOUND: sd=st.balance
+            else: pool+=(st.balance-SEED); sd=SEED
+            start_new_cycle(st,sd)
+        if i==n-1 or (i+1<n and dates[i+1].year!=y):
+            g=yr[y]; tx=max(0.0,g-TAX_DEDUCT)*TAX_RATE
+            if tx>0:
+                if not COMPOUND and pool>=tx: pool-=tx
+                else: st.balance-=tx
+                tc+=tx
+        ex=pool if not COMPOUND else 0.0
+        v=st.balance+st.shares*c+ex; nav.append(v); nl.append(st.balance+st.shares*l+ex)
+        if st.shares>0: act+=1
+        else: idl+=1
+        if v>0: inv+=(st.shares*c)/v
+    class R: pass
+    r=R(); r.nav=nav; r.nav_low=nl; r.dates=dates; r.n_cycle=nc; r.n_reverse=nr
+    r.invested=inv/max(1,act+idl); r.evac_days=evd; return r
+
+def print_killswitch(df):
+    import yfinance as yf
+    print("\n"+"="*88)
+    print("  킬스위치·B1 실험 — 지수(GSPC/M0) 대피 오버레이")
+    print("  은박사: '킬스위치는 폭탄' — QE후 버블<1.30 무발동 예상. 데이터로 확인.")
+    print("="*88)
+    print("  · ^GSPC·M0 수집...")
+    g=yf.download("^GSPC",start=df.index[0].strftime("%Y-%m-%d"),
+                  end=(df.index[-1]+pd.Timedelta(days=1)).strftime("%Y-%m-%d"),
+                  auto_adjust=True,progress=False)["Close"]
+    g=g.squeeze() if hasattr(g,"squeeze") else g; g.index=pd.to_datetime(g.index).tz_localize(None)
+    m0=_fetch_fred_m0()
+    sig=build_signals(g,m0,df.index)
+    nks=int(sig["evac_ks"].sum()); nb1=int(sig["evac_b1"].sum())
+    bmax=sig["bubble"].max(); b2010=sig["bubble"][df.index>=pd.Timestamp("2010-01-01")].max()
+    print(f"  버블 최대 {bmax:.2f} / 2010년후 최대 {b2010:.2f} (1.30 넘어야 킬스위치 발동)")
+    print(f"  킬스위치 대피신호일 {nks}일 / B1 대피신호일 {nb1}일")
+    print("-"*88)
+    print(f"{'모드':<10}{'최종NAV':>14}{'CAGR':>8}{'MDD':>9}{'샤프':>7}{'사이클':>8}{'대피일':>8}{'투자%':>7}")
+    print("-"*88)
+    for mode in ["PURE","KS","B1","KS_B1"]:
+        r=run_killswitch(df,sig,mode=mode)
+        cg,md,sh=metrics(r.nav,r.dates,SEED,r.nav_low)
+        print(f"{mode:<10}{r.nav[-1]:>14,.0f}{cg*100:>7.1f}%{md*100:>8.1f}%{sh:>7.2f}{r.n_cycle:>8}{r.evac_days:>8}{r.invested*100:>6.0f}%")
+    print("="*88)
+    print("  KS=킬스위치(전량청산) / B1=백분위(freeze) / 대피일 0이면 무발동(무매 무영향)")
+    print("  ※ KS 전량청산은 강제 실현→세금 발생 가능. TAX_RATE=0으로도 돌려 순수 전략효과 분리 권장.")
+    print("="*88)
+
+    # ── B1 다중 시작일 (각 시점에서 개선 일관성) ──
+    if START_DATES:
+        print("\n"+"="*104)
+        print("  B1 다중 시작일 — 각 시점에서 PURE vs B1(freeze) 개선 일관성")
+        print("="*104)
+        print(f"{'시작일':<12}{'PURE CAGR':>10}{'PURE MDD':>10}{'PURE샤프':>9} |"
+              f"{'B1 CAGR':>9}{'B1 MDD':>9}{'B1 ΔMDD':>9}{'B1샤프':>8}{'대피일':>8}")
+        print("-"*104)
+        data_start=df.index[0]; seen=set()
+        for sd in START_DATES:
+            eff=max(pd.Timestamp(sd),data_start)
+            if eff in seen: continue
+            seen.add(eff)
+            sub=df[df.index>=eff]
+            if len(sub)<WARMUP+30: continue
+            subsig=sig.reindex(sub.index)
+            rp=run_killswitch(sub,subsig,mode="PURE")
+            rb=run_killswitch(sub,subsig,mode="B1")
+            pc,pm,ps=metrics(rp.nav,rp.dates,SEED,rp.nav_low)
+            bc,bm,bsh=metrics(rb.nav,rb.dates,SEED,rb.nav_low)
+            print(f"{sd:<12}{pc*100:>9.1f}%{pm*100:>9.1f}%{ps:>9.2f} |"
+                  f"{bc*100:>8.1f}%{bm*100:>8.1f}%{(bm-pm)*100:>+8.1f}{bsh:>8.2f}{rb.evac_days:>8}")
+        print("="*104)
+        print("  ΔMDD +: B1이 낙폭 개선. 모든 시작일서 +·샤프 개선이면 B1 채택 근거(VOLTGT와 동일 기준).")
+        print("  B1=고평가(버블 상위20%)+SMA200이탈 시 신규매수 freeze·보유유지. 전량청산 아님.")
+        print("="*104)
+    return sig
+
+def run_combined(df, sig, use_ks=True, use_b1=True, use_voltgt=True):
+    """킬스위치+B1+VOLTGT A 결합. 계층: KS(전량청산) > B1(freeze) > VOLTGT(scale).
+    대피 중이면 매수 없음(VOLTGT 무의미), 정상 매수 시에만 VOLTGT scale 적용."""
+    cvals=df["Close"].values; highs=df["High"].values; lows=df["Low"].values
+    dates=list(df.index); n=len(df)
+    ev_ks=sig["evac_ks"].reindex(df.index).fillna(False).values
+    ev_b1=sig["evac_b1"].reindex(df.index).fillna(False).values
+    above=sig["above_sma200"].reindex(df.index).fillna(True).values
+    rv=rv_series(df["Close"]).values
+    st=State(TICKER,SPLIT,SEED,SEED,0,0.0,0.0,prev_close=None,closes=[])
+    yr=defaultdict(float); rc=0.0; tc=0.0; nc=nr=0; nav=[]; nl=[]; pool=0.0
+    inv=0.0; act=idl=0; evd=0; kse=False; b1e=False
+    for i in range(n):
+        c=float(cvals[i]); h=float(highs[i]); l=float(lows[i]); y=dates[i].year
+        if i<WARMUP:
+            st.closes=(st.closes+[c])[-CLOSES_KEEP:]; st.prev_close=c
+            if len(st.closes)>=5: st.close5_avg=_round2(sum(st.closes[-5:])/5)
+            nav.append(st.balance); nl.append(st.balance); continue
+        j=i-1
+        kss=ev_ks[j] if use_ks else False
+        b1s=ev_b1[j] if use_b1 else False
+        wks=kse
+        if kss: kse=True
+        elif above[j]: kse=False
+        if b1s: b1e=True
+        elif above[j]: b1e=False
+        if kse or b1e: evd+=1
+        # 킬스위치 전량청산
+        if kse and not wks and st.shares>0:
+            ab=st.avg; q=st.shares
+            rl=q*(c-ab)-c*q*FEE_RATE; yr[y]+=rl; rc+=rl
+            st.balance+=c*q*(1-FEE_RATE); nc+=1
+            if COMPOUND: start_new_cycle(st,st.balance)
+            else: pool+=(st.balance-SEED); start_new_cycle(st,SEED)
+        # VOLTGT scale (정상 매수 시에만)
+        scale=1.0
+        if use_voltgt and not kse:
+            rv_use=rv[j] if j>=0 else float('nan')
+            if not np.isnan(rv_use) and rv_use>0: scale=min(1.0,VOLTGT_TARGET/rv_use)
+        # 주문 생성 (VOLTGT A: balance 임시축소)
+        if not kse and scale<1.0:
+            rb=st.balance; st.balance=_round2(rb*scale)
+            orders=suggest_orders(st) if st.prev_close is not None else []
+            st.balance=rb
+        else:
+            orders=suggest_orders(st) if st.prev_close is not None else []
+        # 대피 필터: KS=완전현금, B1=매수freeze
+        if kse: orders=[]
+        elif b1e: orders=[o for o in orders if o.side=="sell"]
+        fills=judge_fills(orders,h,l,c)
+        ab=st.avg; rt=0.0
+        for f in fills:
+            if f.role in ("quarter_sell","tp_sell","rev_first_sell","rev_sell") and ab>0:
+                rt+=f.qty*(f.price-ab)
+            rt-=f.price*f.qty*FEE_RATE
+        yr[y]+=rt; rc+=rt
+        res=update_state(st,fills,c); st.balance-=sum(f.price*f.qty*FEE_RATE for f in fills)
+        for ev in res.events:
+            if "사이클종료" in ev: nc+=1
+            if "리버스전환" in ev: nr+=1
+        if any("사이클종료" in e for e in res.events):
+            if COMPOUND: sd=st.balance
+            else: pool+=(st.balance-SEED); sd=SEED
+            start_new_cycle(st,sd)
+        if i==n-1 or (i+1<n and dates[i+1].year!=y):
+            g=yr[y]; tx=max(0.0,g-TAX_DEDUCT)*TAX_RATE
+            if tx>0:
+                if not COMPOUND and pool>=tx: pool-=tx
+                else: st.balance-=tx
+                tc+=tx
+        ex=pool if not COMPOUND else 0.0
+        v=st.balance+st.shares*c+ex; nav.append(v); nl.append(st.balance+st.shares*l+ex)
+        if st.shares>0: act+=1
+        else: idl+=1
+        if v>0: inv+=(st.shares*c)/v
+    class R: pass
+    r=R(); r.nav=nav; r.nav_low=nl; r.dates=dates; r.n_cycle=nc; r.n_reverse=nr
+    r.invested=inv/max(1,act+idl); r.evac_days=evd; return r
+
+def print_combined(df, sig):
+    print("\n"+"="*98)
+    print("  오버레이 결합 — 순수 vs 각각 vs 전체 결합 (KS+B1+VOLTGT A)")
+    print("="*98)
+    print(f"{'조합':<22}{'최종NAV':>14}{'CAGR':>8}{'MDD':>9}{'샤프':>7}{'사이클':>8}{'대피일':>8}")
+    print("-"*98)
+    combos=[("순수 무매",False,False,False),
+            ("VOLTGT A만",False,False,True),
+            ("B1만",False,True,False),
+            ("KS만",True,False,False),
+            ("B1+VOLTGT A",False,True,True),
+            ("KS+B1+VOLTGT A(전체)",True,True,True)]
+    base=None
+    for name,uk,ub,uv in combos:
+        r=run_combined(df,sig,use_ks=uk,use_b1=ub,use_voltgt=uv)
+        cg,md,sh=metrics(r.nav,r.dates,SEED,r.nav_low)
+        if base is None: base=(cg,md,sh)
+        tag=""
+        if name!="순수 무매":
+            tag=f"  (MDD {(md-base[1])*100:+.1f}, 샤프 {sh-base[2]:+.2f})"
+        print(f"{name:<22}{r.nav[-1]:>14,.0f}{cg*100:>7.1f}%{md*100:>8.1f}%{sh:>7.2f}{r.n_cycle:>8}{r.evac_days:>8}{tag}")
+    print("="*98)
+    print("  KS는 무발동(대피0)이라 순수와 동일 예상. B1·VOLTGT A 결합이 시너지인지 중복인지 확인.")
+    print("="*98)
+
 # ═══ [실행] ═══
 print("="*70)
 print(f"  무한매수법 V4.0 — {TICKER} {SPLIT}분할, 시드 ${SEED:,.0f}, {'복리' if COMPOUND else '단리'}")
@@ -775,6 +1040,11 @@ if RUN_VOLTGT:
     print_voltgt(df)
     if START_DATES:
         print_voltgt_multi(df, START_DATES)
+
+# ── 킬스위치·B1 비교 ──
+if RUN_KILLSWITCH:
+    _sig = print_killswitch(df)
+    print_combined(df, _sig)
 
 # ── 차트 ──
 import matplotlib.pyplot as plt
