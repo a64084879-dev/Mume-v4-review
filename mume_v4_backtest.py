@@ -1,14 +1,72 @@
-Gemini의 회계 3건 수정을 저장본과 대조·재현 검증하겠습니다.명령 2개 실행함, 파일 생성됨명령 2개 실행함, 파일 생성됨이제 회계 항등식을 독립적으로 검증하겠습니다. Gemini의 "통과" 주장을 그대로 믿지 않고, 회계가 실제로 닫히는지(NAV = 시드 + 실현 + 미실현 − 세금) 직접 확인합니다.Verifying tax accrual, single-mode P&L preservation, compound vs simpleVerifying tax accrual, single-mode P&L preservation, compound vs simple세금·단리 보존·복리우위는 개선됐습니다. 그런데 회계 항등식이 실제로 닫히는지를 정밀 검증하니 실현손익 계산에 새 결함이 보입니다. 성분을 분해해 확인합니다.Independent cashflow reconciliation to test if accounting identity closesIndependent cashflow reconciliation to test if accounting identity closes회계 항등식이 독립 현금흐름 검산과 $-0.00로 정확히 닫힙니다. 이제 봇 로직 일치(게이트 c)와 실현손익 계산의 미묘한 경계를 확인합니다.Testing realized-P&L boundaries and bot-logic parity gate CTesting realized-P&L boundaries and bot-logic parity gate C게이트 C에서 불일치가 나왔습니다. 이게 진짜 로직 결함인지, 아니면 봇과 백테스터의 체결 타이밍 차이인지 원인을 규명합니다.Diagnosing gate-C mismatch: bootstrap timing difference between bot and backtesterDiagnosing gate-C mismatch: bootstrap timing difference between bot and backtester원인이 규명됐습니다. 종합 결론입니다.
-회계 3건 — 수정 확인 ✅
-Gemini의 세 가지 수정을 저장본으로 재현·독립 검증한 결과, 모두 정확합니다.
-세금은 이제 실제로 축적됩니다(복리 $1,604 / 단리 $871, 더 이상 $0 아님). 실현손익을 avg_before(갱신 전 평단) 기준으로 직접 계산하는 방식이 옳고, update_state가 매도를 매수보다 먼저 처리하므로 avg_before 기준이 타이밍상 정합합니다. 경계 검증(전량 tp_sell $750 정확, rev_first_sell 매도 인식, rev_quarter_buy 매수 처리)도 통과했습니다.
-단리 손익 증발이 해결됐습니다. profit_pool로 투입원금(시드 고정)과 누적이익을 분리해, 상승장 단리 NAV가 $26,788로 시드를 초과합니다. "계좌 리셋이 아니라 투입원금 고정"이라는 재정의가 정확합니다.
-가장 중요한 것 — 독립 현금흐름 검산으로 회계 항등식이 $-0.00로 정확히 닫힙니다. 엔진 NAV와 "주입금 − 매수지출 + 매도수입 − 수수료 − 세금 + 보유평가"가 완전히 일치합니다. 이건 Gemini의 "통과" 주장을 제 쪽에서 독립적으로 재현한 것이라 신뢰할 수 있습니다. 복리 ≥ 단리도 성립합니다.
-⚠ 게이트 C 주장은 부정확 — 단, 로직 버그는 아님
-Gemini가 "봇과 완전일치($25,699+$539=$26,238)"라고 했는데, 제가 봇 셀프테스트 4일 시나리오와 백테스터를 직접 대조하니 불일치합니다(백테스터 T=3.5·36주 vs 봇 T=2.5·27주). 원인은 로직이 아니라 부트스트랩 타이밍 차이입니다.
-백테스터는 prev_close가 생기는 2일차(07-02)에 곧바로 처음매수를 넣습니다. 반면 봇은 첫 2일을 "종가 이력 적재"로만 소비하고 3일차(07-03)부터 매수를 시작합니다. 그래서 백테스터가 매수를 하루 더 일찍·한 사이클 더 실행해 상태가 벌어집니다. 순수 매매 로직(suggest_orders·update_state)은 동일하지만, "봇과 100% 동일 거동"이라는 설계 원칙과 게이트 C는 이 타이밍 차이 때문에 엄밀히는 미충족입니다.
-이게 실전에 문제가 되는지는 판단이 필요합니다. 백테스트 목적이 "전략의 장기 통계"라면 부트스트랩 하루 차이는 무시 가능합니다. 하지만 "봇과 동일 거동 확인(게이트 c)"이 목적이라면, 백테스터도 봇처럼 첫 N일을 이력적재로 건너뛰도록 맞춰야 주장이 성립합니다. 오버레이(특히 kill-switch)는 SMA200·10년 롤링 백분위 때문에 어차피 워밍업 기간이 필요하므로, 이 참에 백테스터에 명시적 워밍업 구간을 두는 걸 권합니다 — 그러면 타이밍도 봇과 맞고 오버레이 지표 워밍업도 해결됩니다.
-잔여 (오버레이 얹기 전 정리 권장)
-MDD가 여전히 종가 NAV 기준입니다. 주석은 "장중 실제 낙폭(은박사 확정 기준)"인데 judge_fills의 low 인자는 아직 미사용입니다. VOLTGT를 MDD로 검증하실 거라, 오버레이 전에 장중 MDD(보유×저가 반영)로 바꿔두면 VOLTGT 효과 측정이 정확해집니다. 그리고 헤더의 검증 게이트 (b)(c)(d)가 코드엔 (a)(b)만 구현돼 있으니, 오버레이 단계에서 (d) "반등 구간 MDD < 종목 MDD"를 실제 코드로 넣으시면 됩니다.
-QQQDD 기각 확인: 코드에 없습니다 ✅. RV 설계 답변(실 TQQQ 20일 std×√252, scale은 unit_amount에 적용)도 확정 스펙과 정합합니다 — 다만 무매엔 VR의 V가 없어 unit에 태우는 게 맞다는 판단은 타당하나, unit에 scale을 곱하면 별지점·평단·extra 수량이 모두 줄어드는데 T 진행속도까지 함께 느려지는 부수효과가 생깁니다. 이게 의도인지(변동성 높을 때 천천히 진행) 오버레이 설계 시 한 번 짚고 가겠습니다.
-토대 회계는 이제 항등식이 닫히는 견고한 상태입니다. 오버레이 얹으시면 kill-switch·B1·VOLTGT를 확정 스펙과 1:1로 대조하겠습니다. 실데이터는 이 컨테이너가 야후 차단이라, 말씀대로 Colab에서 순수 V4를 먼저 한 번 돌려 이상 없는지 보신 뒤 오버레이로 가는 순서가 안전합니다.
+======================================================================
+  무한매수법 V4.0 백테스트 — TQQQ 40분할, 시드 $20,000, 복리
+======================================================================
+  데이터: 2010-02-11 ~ 2026-07-10 (4127일)
+----------------------------------------------------------------------
+  V4 최종 NAV     : $157,496   (시드 대비 +687%)
+  V4 CAGR         : 13.4%
+  V4 MDD(장중) : -57.8%
+  V4 샤프         : 0.58
+  사이클 종료     : 69회 / 리버스 진입: 5회
+  세금 납부       : $42,634 / 누적 실현손익: $178,997
+----------------------------------------------------------------------
+  TQQQ 보유(세후) : $5,832,494   (시드 대비 +29062%)
+  TQQQ MDD        : -81.7%
+----------------------------------------------------------------------
+  검증 게이트:
+   (a) NAV 음수 없음      : ✅
+   (b) MDD > -100%        : ✅
+   (d) 반등구간 MDD<종목  : ✅ (V4 -57.8% vs 종목 -81.7%)
+======================================================================
+/tmp/ipykernel_846/2864882111.py:573: UserWarning: Glyph 47924 (\N{HANGUL SYLLABLE MU}) missing from font(s) DejaVu Sans.
+  plt.tight_layout(); plt.show()
+/tmp/ipykernel_846/2864882111.py:573: UserWarning: Glyph 54620 (\N{HANGUL SYLLABLE HAN}) missing from font(s) DejaVu Sans.
+  plt.tight_layout(); plt.show()
+/tmp/ipykernel_846/2864882111.py:573: UserWarning: Glyph 47588 (\N{HANGUL SYLLABLE MAE}) missing from font(s) DejaVu Sans.
+  plt.tight_layout(); plt.show()
+/tmp/ipykernel_846/2864882111.py:573: UserWarning: Glyph 49688 (\N{HANGUL SYLLABLE SU}) missing from font(s) DejaVu Sans.
+  plt.tight_layout(); plt.show()
+/tmp/ipykernel_846/2864882111.py:573: UserWarning: Glyph 48277 (\N{HANGUL SYLLABLE BEOB}) missing from font(s) DejaVu Sans.
+  plt.tight_layout(); plt.show()
+/tmp/ipykernel_846/2864882111.py:573: UserWarning: Glyph 48516 (\N{HANGUL SYLLABLE BUN}) missing from font(s) DejaVu Sans.
+  plt.tight_layout(); plt.show()
+/tmp/ipykernel_846/2864882111.py:573: UserWarning: Glyph 54624 (\N{HANGUL SYLLABLE HAL}) missing from font(s) DejaVu Sans.
+  plt.tight_layout(); plt.show()
+/tmp/ipykernel_846/2864882111.py:573: UserWarning: Glyph 48372 (\N{HANGUL SYLLABLE BO}) missing from font(s) DejaVu Sans.
+  plt.tight_layout(); plt.show()
+/tmp/ipykernel_846/2864882111.py:573: UserWarning: Glyph 50976 (\N{HANGUL SYLLABLE YU}) missing from font(s) DejaVu Sans.
+  plt.tight_layout(); plt.show()
+/tmp/ipykernel_846/2864882111.py:573: UserWarning: Glyph 49884 (\N{HANGUL SYLLABLE SI}) missing from font(s) DejaVu Sans.
+  plt.tight_layout(); plt.show()
+/tmp/ipykernel_846/2864882111.py:573: UserWarning: Glyph 46300 (\N{HANGUL SYLLABLE DEU}) missing from font(s) DejaVu Sans.
+  plt.tight_layout(); plt.show()
+/tmp/ipykernel_846/2864882111.py:573: UserWarning: Glyph 48373 (\N{HANGUL SYLLABLE BOG}) missing from font(s) DejaVu Sans.
+  plt.tight_layout(); plt.show()
+/tmp/ipykernel_846/2864882111.py:573: UserWarning: Glyph 47532 (\N{HANGUL SYLLABLE RI}) missing from font(s) DejaVu Sans.
+  plt.tight_layout(); plt.show()
+/usr/local/lib/python3.12/dist-packages/IPython/core/pylabtools.py:151: UserWarning: Glyph 47924 (\N{HANGUL SYLLABLE MU}) missing from font(s) DejaVu Sans.
+  fig.canvas.print_figure(bytes_io, **kw)
+/usr/local/lib/python3.12/dist-packages/IPython/core/pylabtools.py:151: UserWarning: Glyph 54620 (\N{HANGUL SYLLABLE HAN}) missing from font(s) DejaVu Sans.
+  fig.canvas.print_figure(bytes_io, **kw)
+/usr/local/lib/python3.12/dist-packages/IPython/core/pylabtools.py:151: UserWarning: Glyph 47588 (\N{HANGUL SYLLABLE MAE}) missing from font(s) DejaVu Sans.
+  fig.canvas.print_figure(bytes_io, **kw)
+/usr/local/lib/python3.12/dist-packages/IPython/core/pylabtools.py:151: UserWarning: Glyph 49688 (\N{HANGUL SYLLABLE SU}) missing from font(s) DejaVu Sans.
+  fig.canvas.print_figure(bytes_io, **kw)
+/usr/local/lib/python3.12/dist-packages/IPython/core/pylabtools.py:151: UserWarning: Glyph 48277 (\N{HANGUL SYLLABLE BEOB}) missing from font(s) DejaVu Sans.
+  fig.canvas.print_figure(bytes_io, **kw)
+/usr/local/lib/python3.12/dist-packages/IPython/core/pylabtools.py:151: UserWarning: Glyph 48516 (\N{HANGUL SYLLABLE BUN}) missing from font(s) DejaVu Sans.
+  fig.canvas.print_figure(bytes_io, **kw)
+/usr/local/lib/python3.12/dist-packages/IPython/core/pylabtools.py:151: UserWarning: Glyph 54624 (\N{HANGUL SYLLABLE HAL}) missing from font(s) DejaVu Sans.
+  fig.canvas.print_figure(bytes_io, **kw)
+/usr/local/lib/python3.12/dist-packages/IPython/core/pylabtools.py:151: UserWarning: Glyph 48372 (\N{HANGUL SYLLABLE BO}) missing from font(s) DejaVu Sans.
+  fig.canvas.print_figure(bytes_io, **kw)
+/usr/local/lib/python3.12/dist-packages/IPython/core/pylabtools.py:151: UserWarning: Glyph 50976 (\N{HANGUL SYLLABLE YU}) missing from font(s) DejaVu Sans.
+  fig.canvas.print_figure(bytes_io, **kw)
+/usr/local/lib/python3.12/dist-packages/IPython/core/pylabtools.py:151: UserWarning: Glyph 49884 (\N{HANGUL SYLLABLE SI}) missing from font(s) DejaVu Sans.
+  fig.canvas.print_figure(bytes_io, **kw)
+/usr/local/lib/python3.12/dist-packages/IPython/core/pylabtools.py:151: UserWarning: Glyph 46300 (\N{HANGUL SYLLABLE DEU}) missing from font(s) DejaVu Sans.
+  fig.canvas.print_figure(bytes_io, **kw)
+/usr/local/lib/python3.12/dist-packages/IPython/core/pylabtools.py:151: UserWarning: Glyph 48373 (\N{HANGUL SYLLABLE BOG}) missing from font(s) DejaVu Sans.
+  fig.canvas.print_figure(bytes_io, **kw)
+/usr/local/lib/python3.12/dist-packages/IPython/core/pylabtools.py:151: UserWarning: Glyph 47532 (\N{HANGUL SYLLABLE RI}) missing from font(s) DejaVu Sans.
+  fig.canvas.print_figure(bytes_io, **kw)
