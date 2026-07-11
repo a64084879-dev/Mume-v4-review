@@ -4,8 +4,11 @@ name: mume-v4-signal
 
 on:
   schedule:
-    - cron: "30 22 * * 1-5"      # KST 07:30 — 정산+주문표 제안
-    - cron: "30 07 * * 1-5"      # KST 16:30 — /ok 수거 후 제출(승인 시)
+    - cron: "30 22 * * 1-5"      # KST 07:30 — 정산+주문표 제안(전일 마감 직후)
+    - cron: "35 14 * * 1-5"      # UTC 14:35 = KST 23:35 — /ok 수거 후 제출.
+                                 #   ★ UTC 고정 크론 vs 미국장: 서머 개장 UTC13:30 / 표준 UTC14:30.
+                                 #   14:35면 서머 개장+65분·표준 개장+5분 → 연중 개장 이후 보장.
+                                 #   KIS 정규 LOC(34) 접수 시간. 예약주문(LOC 미보존)은 안 씀.
   workflow_dispatch: {}        # 수동 실행 버튼
 
 permissions:
@@ -38,7 +41,7 @@ jobs:
           MUME_KIS_SECRET: ${{ secrets.MUME_KIS_SECRET }}
           MUME_KIS_CANO:   ${{ secrets.MUME_KIS_CANO }}
           MUME_KIS_MOCK:   "1"       # 1=모의(연습) 0=실전
-          MUME_KIS_RESERVE: "1"      # KIS 정규주문은 미국장 시간만 접수 → 낮 제출은 예약주문 필수
+          MUME_KIS_RESERVE: "0"      # ★예약주문은 LOC 미보존(ORD_DVSN=00) → 반드시 0. 정규주문만.
           MUME_ALLOW_MOCK_LOC: "0"   # 모의 LOC 폴백 연습 허용(실전 절대 금지)
         run: python mume_v4_bot.py
 
@@ -49,5 +52,5 @@ jobs:
           git add mume_state.json
           git add .kis_resv_*.json 2>/dev/null || true
           git diff --cached --quiet || git commit -m "state $(date -u +%F)"
-          git pull --rebase origin ${GITHUB_REF_NAME} || true
+          git pull --rebase origin ${GITHUB_REF_NAME}
           git push
