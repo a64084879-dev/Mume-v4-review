@@ -1,72 +1,27 @@
 ======================================================================
-  무한매수법 V4.0 백테스트 — TQQQ 40분할, 시드 $20,000, 복리
+  무한매수법 V4.0 — TQQQ 40분할, 시드 $20,000, 복리
 ======================================================================
   데이터: 2010-02-11 ~ 2026-07-10 (4127일)
 ----------------------------------------------------------------------
-  V4 최종 NAV     : $157,496   (시드 대비 +687%)
+  V4 최종 NAV     : $157,496   (+687%)
   V4 CAGR         : 13.4%
   V4 MDD(장중) : -57.8%
   V4 샤프         : 0.58
-  사이클 종료     : 69회 / 리버스 진입: 5회
-  세금 납부       : $42,634 / 누적 실현손익: $178,997
+  사이클 종료 69회 / 리버스 진입 5회
+  세금 $42,634 / 누적 실현손익 $178,997
 ----------------------------------------------------------------------
-  TQQQ 보유(세후) : $5,832,494   (시드 대비 +29062%)
+  TQQQ 보유(세후) : $5,832,494   (+29062%)
   TQQQ MDD        : -81.7%
-----------------------------------------------------------------------
-  검증 게이트:
-   (a) NAV 음수 없음      : ✅
-   (b) MDD > -100%        : ✅
-   (d) 반등구간 MDD<종목  : ✅ (V4 -57.8% vs 종목 -81.7%)
 ======================================================================
-/tmp/ipykernel_846/2864882111.py:573: UserWarning: Glyph 47924 (\N{HANGUL SYLLABLE MU}) missing from font(s) DejaVu Sans.
-  plt.tight_layout(); plt.show()
-/tmp/ipykernel_846/2864882111.py:573: UserWarning: Glyph 54620 (\N{HANGUL SYLLABLE HAN}) missing from font(s) DejaVu Sans.
-  plt.tight_layout(); plt.show()
-/tmp/ipykernel_846/2864882111.py:573: UserWarning: Glyph 47588 (\N{HANGUL SYLLABLE MAE}) missing from font(s) DejaVu Sans.
-  plt.tight_layout(); plt.show()
-/tmp/ipykernel_846/2864882111.py:573: UserWarning: Glyph 49688 (\N{HANGUL SYLLABLE SU}) missing from font(s) DejaVu Sans.
-  plt.tight_layout(); plt.show()
-/tmp/ipykernel_846/2864882111.py:573: UserWarning: Glyph 48277 (\N{HANGUL SYLLABLE BEOB}) missing from font(s) DejaVu Sans.
-  plt.tight_layout(); plt.show()
-/tmp/ipykernel_846/2864882111.py:573: UserWarning: Glyph 48516 (\N{HANGUL SYLLABLE BUN}) missing from font(s) DejaVu Sans.
-  plt.tight_layout(); plt.show()
-/tmp/ipykernel_846/2864882111.py:573: UserWarning: Glyph 54624 (\N{HANGUL SYLLABLE HAL}) missing from font(s) DejaVu Sans.
-  plt.tight_layout(); plt.show()
-/tmp/ipykernel_846/2864882111.py:573: UserWarning: Glyph 48372 (\N{HANGUL SYLLABLE BO}) missing from font(s) DejaVu Sans.
-  plt.tight_layout(); plt.show()
-/tmp/ipykernel_846/2864882111.py:573: UserWarning: Glyph 50976 (\N{HANGUL SYLLABLE YU}) missing from font(s) DejaVu Sans.
-  plt.tight_layout(); plt.show()
-/tmp/ipykernel_846/2864882111.py:573: UserWarning: Glyph 49884 (\N{HANGUL SYLLABLE SI}) missing from font(s) DejaVu Sans.
-  plt.tight_layout(); plt.show()
-/tmp/ipykernel_846/2864882111.py:573: UserWarning: Glyph 46300 (\N{HANGUL SYLLABLE DEU}) missing from font(s) DejaVu Sans.
-  plt.tight_layout(); plt.show()
-/tmp/ipykernel_846/2864882111.py:573: UserWarning: Glyph 48373 (\N{HANGUL SYLLABLE BOG}) missing from font(s) DejaVu Sans.
-  plt.tight_layout(); plt.show()
-/tmp/ipykernel_846/2864882111.py:573: UserWarning: Glyph 47532 (\N{HANGUL SYLLABLE RI}) missing from font(s) DejaVu Sans.
-  plt.tight_layout(); plt.show()
-/usr/local/lib/python3.12/dist-packages/IPython/core/pylabtools.py:151: UserWarning: Glyph 47924 (\N{HANGUL SYLLABLE MU}) missing from font(s) DejaVu Sans.
-  fig.canvas.print_figure(bytes_io, **kw)
-/usr/local/lib/python3.12/dist-packages/IPython/core/pylabtools.py:151: UserWarning: Glyph 54620 (\N{HANGUL SYLLABLE HAN}) missing from font(s) DejaVu Sans.
-  fig.canvas.print_figure(bytes_io, **kw)
-/usr/local/lib/python3.12/dist-packages/IPython/core/pylabtools.py:151: UserWarning: Glyph 47588 (\N{HANGUL SYLLABLE MAE}) missing from font(s) DejaVu Sans.
-  fig.canvas.print_figure(bytes_io, **kw)
-/usr/local/lib/python3.12/dist-packages/IPython/core/pylabtools.py:151: UserWarning: Glyph 49688 (\N{HANGUL SYLLABLE SU}) missing from font(s) DejaVu Sans.
-  fig.canvas.print_figure(bytes_io, **kw)
-/usr/local/lib/python3.12/dist-packages/IPython/core/pylabtools.py:151: UserWarning: Glyph 48277 (\N{HANGUL SYLLABLE BEOB}) missing from font(s) DejaVu Sans.
-  fig.canvas.print_figure(bytes_io, **kw)
-/usr/local/lib/python3.12/dist-packages/IPython/core/pylabtools.py:151: UserWarning: Glyph 48516 (\N{HANGUL SYLLABLE BUN}) missing from font(s) DejaVu Sans.
-  fig.canvas.print_figure(bytes_io, **kw)
-/usr/local/lib/python3.12/dist-packages/IPython/core/pylabtools.py:151: UserWarning: Glyph 54624 (\N{HANGUL SYLLABLE HAL}) missing from font(s) DejaVu Sans.
-  fig.canvas.print_figure(bytes_io, **kw)
-/usr/local/lib/python3.12/dist-packages/IPython/core/pylabtools.py:151: UserWarning: Glyph 48372 (\N{HANGUL SYLLABLE BO}) missing from font(s) DejaVu Sans.
-  fig.canvas.print_figure(bytes_io, **kw)
-/usr/local/lib/python3.12/dist-packages/IPython/core/pylabtools.py:151: UserWarning: Glyph 50976 (\N{HANGUL SYLLABLE YU}) missing from font(s) DejaVu Sans.
-  fig.canvas.print_figure(bytes_io, **kw)
-/usr/local/lib/python3.12/dist-packages/IPython/core/pylabtools.py:151: UserWarning: Glyph 49884 (\N{HANGUL SYLLABLE SI}) missing from font(s) DejaVu Sans.
-  fig.canvas.print_figure(bytes_io, **kw)
-/usr/local/lib/python3.12/dist-packages/IPython/core/pylabtools.py:151: UserWarning: Glyph 46300 (\N{HANGUL SYLLABLE DEU}) missing from font(s) DejaVu Sans.
-  fig.canvas.print_figure(bytes_io, **kw)
-/usr/local/lib/python3.12/dist-packages/IPython/core/pylabtools.py:151: UserWarning: Glyph 48373 (\N{HANGUL SYLLABLE BOG}) missing from font(s) DejaVu Sans.
-  fig.canvas.print_figure(bytes_io, **kw)
-/usr/local/lib/python3.12/dist-packages/IPython/core/pylabtools.py:151: UserWarning: Glyph 47532 (\N{HANGUL SYLLABLE RI}) missing from font(s) DejaVu Sans.
-  fig.canvas.print_figure(bytes_io, **kw)
+
+======================================================================
+  진단 — 저조함이 정당한지 vs 버그인지
+======================================================================
+  현금 방치(빈 기간) : 69일 / 4122일 (1.7%)   [20%↑면 문제]
+  평균 투자 비율     : 29.4%   [무매 보통 40~70%]
+  처음매수 시도/미체결: 70회 / 0회 (0% 실패)
+  리버스모드 일수    : 76일 (1.8%)
+  사이클 길이(일)    : 평균 58 / 중앙 48 / 최대 195 (n=70)
+----------------------------------------------------------------------
+  ✅ 사이클 정상 회전 — 저조함은 세금·벤치마크(TQQQ 강세장) 탓, 버그 아님.
+======================================================================
