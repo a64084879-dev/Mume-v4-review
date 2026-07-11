@@ -105,11 +105,11 @@ def orders_to_json(orders: List[Order]) -> list:
 def fetch_ohlc(ticker: str):
     """최근 15거래일 OHLC. 반환: list of (date_str, open, high, low, close)."""
     import yfinance as yf
-    df = yf.download(ticker, period="1mo", auto_adjust=True, progress=False)
+    df = yf.download(ticker, period="3mo", auto_adjust=True, progress=False)
     if hasattr(df.columns, "levels"):
         df.columns = [c[0] for c in df.columns]
     out = []
-    for idx, row in df.tail(15).iterrows():
+    for idx, row in df.tail(35).iterrows():
         out.append((idx.strftime("%Y-%m-%d"), float(row["Open"]), float(row["High"]),
                     float(row["Low"]), float(row["Close"])))
     return out
@@ -332,6 +332,13 @@ def run_daily(mock_ohlc=None):
     else:
         # VOLTGT A: 변동성 높으면 1회매수금 축소(balance 임시 축소로 unit↓). 백테스터 A와 동일.
         scale = voltgt_scale(st.closes or [])
+        vtag = ""
+        if VOLTGT_ON:
+            n_cl = len(st.closes or [])
+            if n_cl < VOLTGT_LOOKBACK + 1:
+                vtag = f" · VOLTGT 대기(이력 {n_cl}/{VOLTGT_LOOKBACK + 1})"
+            elif scale < 1.0:
+                vtag = f" · VOLTGT scale {scale:.2f}(RV↑ 매수축소)"
         if scale < 1.0:
             real_bal = st.balance
             st.balance = _round2(real_bal * scale)
@@ -342,7 +349,6 @@ def run_daily(mock_ohlc=None):
         oj = orders_to_json(orders)
         d["pending_orders"] = oj
         d["pending_hash"] = _ohash(oj)
-        vtag = f" · VOLTGT scale {scale:.2f}(RV↑ 매수축소)" if scale < 1.0 else ""
         lines += ["── 오늘의 주문 제안 (LOC 예약 / 지정가는 프리장부터)" + vtag, fmt_orders(orders)]
         if st.mode == "reverse" and not st.rev_first and st.close5_avg is None:
             lines.append("⚠ 5일 종가 이력 부족 — 리버스 별지점 산출 불가(주문 없음). 다음 거래일 자동 해소.")
