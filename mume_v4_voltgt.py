@@ -36,20 +36,16 @@ def rv_series(closes: pd.Series, lookback=VOLTGT_LOOKBACK) -> pd.Series:
     return ret.rolling(lookback).std() * np.sqrt(252)
 
 def scale_orders(orders, scale):
-    """주문 리스트의 매수 수량에 scale 적용 (방식 B용). 매도는 그대로."""
+    """방식 B: 진행매수(star/avg) 수량에만 scale. 처음매수는 A와 통일(면제),
+    extra 사다리·매도는 무영향. (extra 중복·first_big 정책 오염 수정)"""
     out = []
     for o in orders:
-        if o.side == "buy" and o.role in ("first_big", "star_buy", "avg_buy"):
+        if o.side == "buy" and o.role in ("star_buy", "avg_buy"):  # first_big 제외(A와 통일)
             q = int(o.qty * scale)
             if q > 0:
                 out.append(Order(o.side, o.kind, o.price, q, o.tag, role=o.role))
-            # extra_buy(1주 사다리)는 scale 안 함 (폭락 대비 유지)
         else:
-            out.append(o)
-    # extra_buy는 원본 유지
-    for o in orders:
-        if o.role == "extra_buy":
-            out.append(o)
+            out.append(o)   # first_big, extra_buy, 매도 전부 원본 1회만
     return out
 
 
@@ -79,8 +75,11 @@ def run_voltgt(df, mode="PURE", ticker="TQQQ", split=40, seed=20000,
 
         # ── VOLTGT scale ──
         scale = 1.0
-        if mode in ("A", "B") and not np.isnan(rv[i]) and rv[i] > 0:
-            scale = min(1.0, VOLTGT_TARGET / rv[i])
+        # look-ahead 제거: 당일(i) rv는 당일 수익률 포함 → 전일(i-1) rv로 주문 결정.
+        # 봇이 '전일까지의 closes'로 scale 계산하는 것과 정합.
+        rv_use = rv[i-1] if i >= 1 else float('nan')
+        if mode in ("A", "B") and not np.isnan(rv_use) and rv_use > 0:
+            scale = min(1.0, VOLTGT_TARGET / rv_use)
 
         # ── 주문 계산 (방식 A: unit 자체를 줄임) ──
         if mode == "A" and scale < 1.0:
