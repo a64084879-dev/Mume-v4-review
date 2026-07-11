@@ -65,8 +65,14 @@ def loc_submit_allowed(adapter: BrokerAdapter) -> Tuple[bool, str]:
     n = adapter.name
     if n == "kis":
         mock = bool(getattr(adapter, "mock", True))
+        reserve = bool(getattr(adapter, "use_reserve", False))
+        if reserve:
+            # ★ 예약주문 경로는 ORD_DVSN="00"(지정가) 하드코딩 → LOC(34) 미보존.
+            #   별지점이 장중 지정가로 나가 즉시 체결 위험. LOC 무결성 위배 → 차단.
+            return False, ("KIS 예약주문은 ORD_DVSN=00(지정가)로 LOC 미보존 — 별지점 즉시체결 위험. "
+                           "정규주문(use_reserve=0)+미국장 시간 크론 사용")
         if not mock:
-            return True, "KIS 실전 — 진짜 LOC(34)/MOC(33) 지원 ✅"
+            return True, "KIS 실전 정규주문 — 진짜 LOC(34)/MOC(33) 지원 ✅ (미국장 시간 접수)"
         if os.environ.get("MUME_ALLOW_MOCK_LOC", "0") == "1":
             return True, "⚠ KIS 모의 — LOC가 marketable limit으로 폴백됨(연습 전용, 실전 금지)"
         return False, "KIS 모의는 LOC 미지원(marketable 폴백) — 연습 허용은 MUME_ALLOW_MOCK_LOC=1"
@@ -94,9 +100,9 @@ def submit_orders(adapter: BrokerAdapter, symbol: str, orders: List[Order],
     if not ok:
         return already, [f"⛔ 제출 차단: {why}"]
     logs.append(f"제출 경로: {adapter.name} — {why}")
-    if adapter.name == "kis" and not bool(getattr(adapter, "use_reserve", False)):
-        logs.append("  ⚠ KIS 정규주문은 미국장 시간대만 접수 — 낮(16:30) 제출은 "
-                    "MUME_KIS_RESERVE=1(예약주문) 권장 또는 크론을 KST 22:00 이후로")
+    if adapter.name == "kis":
+        logs.append("  ⚠ KIS 정규주문 LOC(34)는 미국장 개장 후에만 접수 — 제출 크론 UTC 14:35"
+                    "(=KST 23:35, 서머·표준 모두 개장 이후). 예약주문은 LOC 미보존이라 사용 불가.")
     # sanity: 매수 총액 ≤ 잔금×1.02 (수수료 여유)
     buy_total = sum((o.price or 0) * o.qty for o in orders if o.side == "buy")
     if buy_total > balance * 1.02:
@@ -119,7 +125,9 @@ def submit_orders(adapter: BrokerAdapter, symbol: str, orders: List[Order],
 
 # ══════════════ 자동 정산 (조회 → role 매칭 → 상태 보정) ══════════════
 def _match_role(f, pending: list, id_map: dict) -> str:
-    """체결 1건의 role 판정. ①order_id 맵 ②지정가매도 price 일치 ③side·qty·지정가 조건 ④'?'"""
+    """[구버전·참조용] 단건 role 판정. 현재 reconcile은 소비형 match_fills 사용.
+    단건 조회·디버깅용으로만 유지(중복배정 방지가 없으므로 정산 경로에서 쓰지 말 것).
+    ①order_id 맵 ②지정가매도 price 일치 ③side·qty·지정가 조건 ④'?'"""
     for rec in id_map.values():
         if isinstance(rec, dict) and rec.get("order_id") == f.order_id:
             return rec["role"]
@@ -156,8 +164,8 @@ def match_fills(raw: list, pending: list, id_map: dict) -> Tuple[list, List[str]
             tp=[p for p in cs if p["role"]=="tp_sell" and p.get("price")
                 and abs(f.price-p["price"])<0.011]
             if tp: return tp
-            return [p for p in cs if p.get("price") and f.price>=p["price"]-0.011
-                    and (p.get("qty")==f.qty or True)]
+            # LOC매도: 종가 ≥ 지정가면 체결 가능(부분체결 허용 → 수량 일치 강제 안 함)
+            return [p for p in cs if p.get("price") and f.price>=p["price"]-0.011]
         return [p for p in remaining if p["side"]=="buy" and p.get("price")
                 and f.price<=p["price"]+0.011]
     # ① order_id 확정
@@ -185,13 +193,16 @@ def match_fills(raw: list, pending: list, id_map: dict) -> Tuple[list, List[str]
             if pick is not None:
                 out.append((f,pick["role"])); remaining.remove(pick)
                 unresolved.remove(f); changed=True
-    # ③ 동수량 세트 폴백: 잔여 체결·후보의 수량 multiset 일치 → 일괄 배정
+    # ③ 동수량 세트 폴백: '가격조건상 체결 가능했던' 후보만 대상(미체결 확정 후보 배제).
+    #   extra 사다리처럼 종가에 안 닿은 후보를 빼야 len(fs)==len(elig)가 성립한다.
     if unresolved:
         for side in ("buy","sell"):
             fs=[f for f in unresolved if f.side==side]
-            cs=[p for p in remaining if p["side"]==side]
-            if fs and len(fs)==len(cs) and sorted(f.qty for f in fs)==sorted(p["qty"] for p in cs):
-                fs2=sorted(fs,key=lambda f:(f.qty,f.price)); cs2=sorted(cs,key=lambda p:(p["qty"],p["price"] or 0))
+            if not fs: continue
+            elig=[p for p in remaining if p["side"]==side
+                  and any(p in _cands(f) for f in fs)]      # ← 미체결 확정 후보 배제
+            if len(fs)==len(elig) and sorted(f.qty for f in fs)==sorted(p["qty"] for p in elig):
+                fs2=sorted(fs,key=lambda f:(f.qty,f.price)); cs2=sorted(elig,key=lambda p:(p["qty"],p["price"] or 0))
                 for f,p in zip(fs2,cs2):
                     out.append((f,p["role"])); remaining.remove(p); unresolved.remove(f)
                 logs.append(f"  · 동수량 세트 매칭({side}) {len(fs2)}건 — role 집합 기준 T 안전")
