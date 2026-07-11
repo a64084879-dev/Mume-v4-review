@@ -33,6 +33,8 @@ from dataclasses import dataclass, field
 from typing import List, Optional
 from mume_v4_core import State, Order, _round2
 
+CLOSES_KEEP = 30   # 종가 이력 보관수 — VOLTGT RV(20일)+여유. 봇·state 공용.
+
 @dataclass
 class Fill:
     """하루 체결 1건. role은 Order.role과 동일."""
@@ -135,7 +137,7 @@ def update_state(st: State, fills: List[Fill], today_close: float) -> UpdateResu
     if not hasattr(st, "closes") or st.closes is None:
         st.closes = []
     st.closes.append(today_close)
-    st.closes = st.closes[-10:]
+    st.closes = st.closes[-CLOSES_KEEP:]
     if len(st.closes) >= 5:
         # 원글: 리버스 별지점 = '직전 5거래일 종가 평균' — 다음 세션 기준 최근 5개 종가.
         #   (bot.to_State와 동일 정의로 통일 — 이중 정의 제거)
