@@ -24,10 +24,14 @@
 환경변수: MUME_TG_TOKEN, MUME_TG_CHAT (필수) | MUME_TICKER, MUME_SPLIT, MUME_SEED(초기 1회)
 """
 import os, sys, json, datetime, hashlib
-from typing import List, Optional
+from typing import List
 import requests
+try:
+    import pandas as pd    # 킬스위치·B1 지수 신호용(없으면 해당 기능 비활성)
+except ImportError:
+    pd = None
 
-from mume_v4_core import State, Order, suggest_orders, star_price, star_pct, unit_amount, is_first_half, _round2
+from mume_v4_core import State, Order, suggest_orders, star_price, star_pct, is_first_half, _round2
 from mume_v4_state import Fill, update_state, start_new_cycle, CLOSES_KEEP
 try:
     from mume_v4_broker import load_adapter, reconcile, submit_orders, loc_submit_allowed
@@ -46,6 +50,15 @@ DRY_RUN  = os.environ.get("MUME_DRY", "0") == "1"          # 1=발송 대신 std
 VOLTGT_ON     = os.environ.get("MUME_VOLTGT", "1") == "1"   # 1=켬(기본)
 VOLTGT_TARGET = float(os.environ.get("MUME_VOLTGT_TARGET", "0.60"))
 VOLTGT_LOOKBACK = int(os.environ.get("MUME_VOLTGT_LOOKBACK", "20"))
+# 킬스위치·B1 (지수 GSPC/M0 대피 오버레이). 백테스트로 채택.
+#  킬스위치: 버블≥1.30 AND SMA200이탈 → 전액매도(극단 방어, 평시 무발동)
+#  B1: 버블 10년 백분위≥80% AND SMA200이탈 → 신규매수 freeze(보유유지)
+KILLSWITCH_ON = os.environ.get("MUME_KILLSWITCH", "1") == "1"
+B1_ON         = os.environ.get("MUME_B1", "1") == "1"
+BUBBLE_LIMIT  = 1.30
+B1_WINDOW     = 2520      # 10년
+B1_PCTL       = 0.80
+FRED_API_KEY  = os.environ.get("MUME_FRED_KEY", "")   # M0용. 없으면 킬스위치·B1 비활성
 KST = datetime.timezone(datetime.timedelta(hours=9))
 
 # ══════════════ 상태 저장/복원 ══════════════
@@ -54,7 +67,8 @@ def _default_state() -> dict:
             "shares": 0, "avg": 0.0, "T": 0.0, "mode": "normal", "rev_first": False,
             "closes": [], "last_date": None, "pending_orders": [],
             "tg_offset": 0, "paused": False, "await_restart": False,
-            "approved_date": None, "submitted": {}}
+            "approved_date": None, "submitted": {},
+            "ks_evacuated": False, "b1_evacuated": False}   # 대피 상태 지속(복귀 판정용)
 
 def load_state() -> dict:
     if os.path.exists(STATE_FILE):
@@ -81,6 +95,56 @@ def from_State(st: State, d: dict):
 def _ohash(orders_json: list) -> str:
     """주문표 스냅샷 해시 — /ok 승인 시점과 제출 시점의 주문표 동일성 보장."""
     return hashlib.md5(json.dumps(orders_json, sort_keys=True).encode()).hexdigest()[:12]
+
+def fetch_index_signals():
+    """GSPC(야후)·M0(FRED)로 킬스위치·B1 대피 신호 계산.
+    반환: dict(ks_evac, b1_evac, above_sma200, bubble, ok) — ok=False면 데이터부족(비활성).
+    look-ahead 방지: 전일까지의 데이터로 오늘 판정(백테스터 j=i-1과 정합)."""
+    if not (KILLSWITCH_ON or B1_ON):
+        return {"ok": False, "reason": "off"}
+    if not FRED_API_KEY:
+        return {"ok": False, "reason": "FRED 키 없음 → 킬스위치·B1 비활성"}
+    try:
+        import yfinance as yf, urllib.request, json as _json
+        # GSPC 3년치(SMA200·최근 판정용). B1은 10년 필요하나 봇은 최근 신호만 쓰므로
+        # 백분위 임계는 FRED M0 전체로 계산.
+        g = yf.download("^GSPC", period="max", auto_adjust=True, progress=False)["Close"]
+        g = g.squeeze() if hasattr(g, "squeeze") else g
+        g.index = pd.to_datetime(g.index).tz_localize(None)
+        g = g.dropna()
+        # M0 (FRED BOGMBASE)
+        end = datetime.date.today().strftime("%Y-%m-%d")
+        url = (f"https://api.stlouisfed.org/fred/series/observations?series_id=BOGMBASE"
+               f"&api_key={FRED_API_KEY}&file_type=json&observation_start=1985-01-01&observation_end={end}")
+        with urllib.request.urlopen(url, timeout=30) as r:
+            obs = _json.loads(r.read()).get("observations", [])
+        md = pd.DataFrame(obs); md["date"] = pd.to_datetime(md["date"])
+        md["value"] = pd.to_numeric(md["value"], errors="coerce")
+        m0 = md.set_index("date")["value"].dropna()
+        # 정렬·정규화: SMA200은 GSPC native 거래일로 계산(휴장일 ffill 왜곡 방지 — A2).
+        # M0만 GSPC 거래일에 맞춰 reindex.
+        g = g.dropna()
+        m0 = m0.reindex(g.index).ffill().bfill()
+        if m0.max() > 100000: m0 = m0 / 1000.0
+        sma200 = g.rolling(200).mean()      # native 거래일 200개
+        bubble = g / m0
+        # 신호일 = 데이터의 마지막 완결 bar(A3: wall-clock today() 대신 데이터 기준).
+        # 봇은 장 시작 전 실행이라 마지막 bar가 전 거래일. 타임존 off-by-one 제거.
+        if len(g) == 0:
+            return {"ok": False, "reason": "GSPC 데이터 없음"}
+        ts = g.index[-1]
+        b = float(bubble.loc[ts]); gspc_v = float(g.loc[ts]); sma_v = float(sma200.loc[ts])
+        if pd.isna(sma_v):
+            return {"ok": False, "reason": "SMA200 미형성(200거래일 미만)"}
+        above = gspc_v > sma_v
+        ks = KILLSWITCH_ON and (b >= BUBBLE_LIMIT) and (not above)
+        b1_th = bubble.rolling(B1_WINDOW, min_periods=252).quantile(B1_PCTL).loc[ts]
+        b1 = B1_ON and (not pd.isna(b1_th)) and (b >= b1_th) and (not above)
+        return {"ok": True, "ks_evac": ks, "b1_evac": b1, "above_sma200": above,
+                "bubble": b, "signal_date": str(ts.date()),
+                "b1_thresh": float(b1_th) if not pd.isna(b1_th) else None}
+    except Exception as e:
+        return {"ok": False, "reason": f"지수 수집 실패: {e}"}
 
 def voltgt_scale(closes: list) -> float:
     """VOLTGT A: RV = 최근 LOOKBACK일 수익률 std × √252 (실 TQQQ 가격 기준).
@@ -215,14 +279,15 @@ def fmt_orders(orders: List[Order]) -> str:
     buys = [o for o in orders if o.side == "buy"]
     sells = [o for o in orders if o.side == "sell"]
     L = []
+    def _fmt1(o):
+        # MOC는 kind 기준으로 판정(price 관례가 None이든 뭐든 견고). 그 외는 가격 표시.
+        if o.kind == "MOC" or o.price is None:
+            return f"  MOC × {o.qty}주 ({o.tag})"
+        return f"  {o.kind} ${o.price:.2f} × {o.qty}주 ({o.tag})"
     if buys:
-        L.append(" [매수]")
-        L += [f"  {o.kind} ${o.price:.2f} × {o.qty}주 ({o.tag})" if o.price is not None
-              else f"  MOC × {o.qty}주 ({o.tag})" for o in buys]
+        L.append(" [매수]"); L += [_fmt1(o) for o in buys]
     if sells:
-        L.append(" [매도]")
-        L += [f"  {o.kind} ${o.price:.2f} × {o.qty}주 ({o.tag})" if o.price is not None
-              else f"  MOC × {o.qty}주 ({o.tag})" for o in sells]
+        L.append(" [매도]"); L += [_fmt1(o) for o in sells]
     return "\n".join(L) if L else " (제안 주문 없음)"
 
 def fmt_state(st: State) -> str:
@@ -330,26 +395,71 @@ def run_daily(mock_ohlc=None):
     elif d.get("await_restart"):
         lines.append("🔔 사이클 종료 상태 — /restart <새시드> 로 재시작 (복리=잔금 전액, 단리=기존 시드)")
     else:
-        # VOLTGT A: 변동성 높으면 1회매수금 축소(balance 임시 축소로 unit↓). 백테스터 A와 동일.
+        # ── 킬스위치·B1 state machine (신호 + 저장된 대피상태 → 전이) ──
+        # 봇은 매일 독립 실행이라 대피 상태를 state에 저장해 복귀(SMA200 돌파)까지 추적.
+        sig = fetch_index_signals()
+        ks_evac = bool(d.get("ks_evacuated", False))
+        b1_evac = bool(d.get("b1_evacuated", False))
+        if sig.get("ok"):
+            above = sig.get("above_sma200", True)
+            # 킬스위치: 신호 시 대피 진입, SMA200 돌파 시 복귀
+            if sig.get("ks_evac"): ks_evac = True
+            elif above: ks_evac = False
+            # B1: 신호 시 대피 진입, SMA200 돌파 시 복귀
+            if sig.get("b1_evac"): b1_evac = True
+            elif above: b1_evac = False
+            d["ks_evacuated"] = ks_evac
+            d["b1_evacuated"] = b1_evac
+        else:
+            # 데이터 없으면 대피상태 유지(안전) + 신규 대피판정 안 함
+            pass
+
+        evac_tag = ""
+        if sig.get("ok"):
+            if ks_evac:
+                evac_tag = f" · 🚨킬스위치 대피중(버블 {sig.get('bubble',0):.2f}) → 전액매도/현금"
+            elif b1_evac:
+                evac_tag = f" · ⚠B1 대피중(고평가+SMA200이탈) → 신규매수 freeze(보유유지)"
+        elif KILLSWITCH_ON or B1_ON:
+            state_note = ""
+            if ks_evac or b1_evac:
+                state_note = f" [대피상태 유지: KS={ks_evac} B1={b1_evac}]"
+            evac_tag = f" · 킬스위치·B1 데이터없음({sig.get('reason','')}){state_note}"
+
+        # VOLTGT A: 대피 중엔 무의미(매수 없음)
         scale = voltgt_scale(st.closes or [])
         vtag = ""
-        if VOLTGT_ON:
+        if VOLTGT_ON and not ks_evac and not b1_evac:
             n_cl = len(st.closes or [])
             if n_cl < VOLTGT_LOOKBACK + 1:
                 vtag = f" · VOLTGT 대기(이력 {n_cl}/{VOLTGT_LOOKBACK + 1})"
             elif scale < 1.0:
                 vtag = f" · VOLTGT scale {scale:.2f}(RV↑ 매수축소)"
-        if scale < 1.0:
+
+        # 주문 생성 (VOLTGT A: balance 임시축소). 킬스위치 대피 시 scale 무의미.
+        if scale < 1.0 and not ks_evac:
             real_bal = st.balance
             st.balance = _round2(real_bal * scale)
             orders = suggest_orders(st)
             st.balance = real_bal
         else:
             orders = suggest_orders(st)
+
+        # ── 대피 필터 ──
+        if ks_evac:
+            # 킬스위치: 전액매도(MOC 종가청산, 보유>0) + 신규매수 없음
+            if st.shares > 0:
+                orders = [Order("sell", "MOC", None, st.shares,
+                                "킬스위치 전액청산(종가 시장가)", role="ks_liquidate")]
+            else:
+                orders = []
+        elif b1_evac:
+            orders = [o for o in orders if o.side == "sell"]
+
         oj = orders_to_json(orders)
         d["pending_orders"] = oj
         d["pending_hash"] = _ohash(oj)
-        lines += ["── 오늘의 주문 제안 (LOC 예약 / 지정가는 프리장부터)" + vtag, fmt_orders(orders)]
+        lines += ["── 오늘의 주문 제안 (LOC 예약 / 지정가는 프리장부터)" + vtag + evac_tag, fmt_orders(orders)]
         if st.mode == "reverse" and not st.rev_first and st.close5_avg is None:
             lines.append("⚠ 5일 종가 이력 부족 — 리버스 별지점 산출 불가(주문 없음). 다음 거래일 자동 해소.")
         today_kst = datetime.datetime.now(KST).strftime("%Y-%m-%d")
