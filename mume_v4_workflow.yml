@@ -38,6 +38,7 @@ jobs:
           MUME_KIS_SECRET: ${{ secrets.MUME_KIS_SECRET }}
           MUME_KIS_CANO:   ${{ secrets.MUME_KIS_CANO }}
           MUME_KIS_MOCK:   "1"       # 1=모의(연습) 0=실전
+          MUME_KIS_RESERVE: "1"      # KIS 정규주문은 미국장 시간만 접수 → 낮 제출은 예약주문 필수
           MUME_ALLOW_MOCK_LOC: "0"   # 모의 LOC 폴백 연습 허용(실전 절대 금지)
         run: python mume_v4_bot.py
 
@@ -46,5 +47,7 @@ jobs:
           git config user.name  "mume-bot"
           git config user.email "bot@local"
           git add mume_state.json
+          git add .kis_resv_*.json 2>/dev/null || true
           git diff --cached --quiet || git commit -m "state $(date -u +%F)"
+          git pull --rebase origin ${GITHUB_REF_NAME} || true
           git push
