@@ -28,7 +28,7 @@ from typing import List, Optional
 import requests
 
 from mume_v4_core import State, Order, suggest_orders, star_price, star_pct, unit_amount, is_first_half, _round2
-from mume_v4_state import Fill, update_state, start_new_cycle
+from mume_v4_state import Fill, update_state, start_new_cycle, CLOSES_KEEP
 try:
     from mume_v4_broker import load_adapter, reconcile, submit_orders, loc_submit_allowed
 except Exception:
@@ -76,7 +76,7 @@ def to_State(d: dict) -> State:
 def from_State(st: State, d: dict):
     d.update({"seed": st.seed, "balance": st.balance, "shares": st.shares,
               "avg": st.avg, "T": st.T, "mode": st.mode, "rev_first": st.rev_first,
-              "closes": list(st.closes or [])[-30:]})
+              "closes": list(st.closes or [])[-CLOSES_KEEP:]})
 
 def _ohash(orders_json: list) -> str:
     """주문표 스냅샷 해시 — /ok 승인 시점과 제출 시점의 주문표 동일성 보장."""
@@ -103,7 +103,7 @@ def orders_to_json(orders: List[Order]) -> list:
 
 # ══════════════ 시세 ══════════════
 def fetch_ohlc(ticker: str):
-    """최근 15거래일 OHLC. 반환: list of (date_str, open, high, low, close)."""
+    """최근 35거래일 OHLC(VOLTGT RV 20일+여유). 반환: (date,open,high,low,close) 리스트."""
     import yfinance as yf
     df = yf.download(ticker, period="3mo", auto_adjust=True, progress=False)
     if hasattr(df.columns, "levels"):
@@ -258,7 +258,7 @@ def run_daily(mock_ohlc=None):
     if d["last_date"] is None and new_days:
         # 최초 부트스트랩: 종가 이력만 적재(체결 추정 없음)
         for r in new_days:
-            d["closes"] = (d["closes"] + [r[4]])[-30:]
+            d["closes"] = (d["closes"] + [r[4]])[-CLOSES_KEEP:]
         d["last_date"] = new_days[-1][0]
         lines.append(f"── 부트스트랩: 종가 이력 {len(new_days)}일 적재 (최근 ${new_days[-1][4]:.2f})")
     elif new_days:
