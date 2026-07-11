@@ -1,8 +1,10 @@
 # ============================================================================
-#  무한매수법 V4.0 백테스터 — Colab 단일 셀 (순수 V4 + 진단 리포트)
-#  라오어 원글 posts/79263·79264 기준. 개인 실행 전용(재가공·외부배포 금지).
-#  검증: core(별% 7/7·원글표), state(T규칙·리버스·회계), backtest(봇일치·항등식닫힘)
-#  실행: 이 셀 전체를 Colab에 붙여넣고 Shift+Enter. TQQQ 자동 수집.
+#  무한매수법 V4.0 백테스터 — 실 TQQQ 2010~2026 전용 (Colab 단일 셀)
+#  ★무매는 정수주 매매라 합성 초고가 구간에서 스케일 왜곡 → 실 TQQQ만 사용.
+#  ★다중 시작일: 2010 이후 여러 시점에서 시작했을 때 성과 비교.
+#  ★세전 확인(카페 인증 비교)은 TAX_RATE = 0.0
+#  검증: core(별% 7/7·원글표), state(T규칙·리버스), backtest(봇일치·항등식닫힘)
+#  라오어 원글 기준. 개인 실행 전용(재가공·외부배포 금지).
 # ============================================================================
 !pip -q install yfinance 2>/dev/null
 
@@ -16,14 +18,20 @@ TICKER      = "TQQQ"       # "TQQQ" / "SOXL"
 SPLIT       = 40           # 20 / 40
 SEED        = 20000.0      # 시드(원금)
 COMPOUND    = True         # True=복리 / False=단리(원금 고정)
-DATA_START  = "2010-02-11" # TQQQ 상장 부근 (SOXL은 2010-03-11)
+DATA_START  = "2010-02-11" # TQQQ 상장 부근
 DATA_END    = None         # None=오늘
 WARMUP      = 5            # 워밍업일(이력적재)
 FEE_RATE    = 0.0015       # 편도 수수료
-TAX_RATE    = 0.22         # 양도세
+TAX_RATE    = 0.22         # 양도세 (세전 확인은 0.0)
 TAX_DEDUCT  = 1850.0       # 연 공제
-FIRST_PREMIUM = 0.12       # 처음매수 프리미엄(×1.12). 상승장 미체결 잦으면 0.05로 낮춰 실험
+FIRST_PREMIUM = 0.12       # 처음매수 프리미엄
 INTRADAY_MDD  = True       # 장중MDD(저가반영)
+# 다중 시작일(2010 이후만 유효). []=단일 실행
+START_DATES = ["2010-02-11","2013-01-02","2016-01-02","2018-01-02",
+               "2020-01-02","2021-01-02","2022-01-02","2024-01-02"]
+RUN_VOLTGT = True          # VOLTGT 실험: 순수무매 vs A(unit축소·T지연) vs B(수량만축소)
+VOLTGT_TARGET = 0.60       # 목표변동성
+VOLTGT_LOOKBACK = 20       # RV 룩백
 
 # ═══ [코어] 주문계산 ═══
 # ══════════════ 종목·분할 설정 ══════════════
@@ -563,6 +571,154 @@ def make_synthetic(seed=7, start="2015-01-02", end="2020-12-31", crash=True):
 
 
 
+# ═══ [다중 시작일 표] ═══
+def run_multi(df_full, start_dates):
+    print("="*118)
+    print(f"  무한매수법 V4 {TICKER} {SPLIT}분할 (시드 ${SEED:,.0f}, {'복리' if COMPOUND else '단리'}, 세후) · 다중 시작일 · 종료 {df_full.index[-1].date()}")
+    print("="*118)
+    print(f"{'시작일':<12}{'년수':>6}{'원금':>12}{'무매세후':>16}{'TQQQ보유':>16}{'CAGR':>8}{'MDD':>9}{'샤프':>7}{'사이클':>8}{'리버스':>7}{'투자%':>7}")
+    print("-"*118)
+    data_start = df_full.index[0]; seen=set()
+    for sd in start_dates:
+        sd_ts = pd.Timestamp(sd); eff = max(sd_ts, data_start)
+        if eff in seen:
+            print(f"{sd:<12}  (데이터 {data_start.date()}부터 — 위 행과 동일, 스킵)"); continue
+        seen.add(eff)
+        sub = df_full[df_full.index >= eff]
+        if len(sub) < WARMUP + 30:
+            print(f"{sd:<12}  데이터 부족(스킵)"); continue
+        r = run_backtest(sub, ticker=TICKER, split=SPLIT, seed=SEED, compound=COMPOUND, fee=FEE_RATE, warmup=WARMUP)
+        cg, md, sh = metrics(r.nav, r.dates, SEED, r.nav_low)
+        bh = buy_hold_aftertax(sub, SEED)
+        yrs = (r.dates[-1]-r.dates[0]).days/365.25
+        inv = r.diag.get("invested_frac_avg",0)*100
+        note = "" if sd_ts >= data_start else f" *실제 {eff.date()}"
+        print(f"{sd:<12}{yrs:>6.1f}{SEED:>12,.0f}{r.nav[-1]:>16,.0f}{bh:>16,.0f}{cg*100:>7.1f}%{md*100:>8.1f}%{sh:>7.2f}{r.n_cycle:>8}{r.n_reverse:>7}{inv:>6.0f}%{note}")
+    print("="*118)
+    print("  ※ 무매세후=V4(세금22%·수수료0.15%) / TQQQ보유=단순보유 세후 / MDD=장중")
+    print("="*118)
+
+# ═══ [VOLTGT 오버레이] 순수무매 위에 변동성타겟 (core 무수정) ═══
+def rv_series(closes, lookback=VOLTGT_LOOKBACK):
+    return closes.pct_change().rolling(lookback).std() * np.sqrt(252)
+
+def _scale_orders(orders, scale):
+    out=[]
+    for o in orders:
+        if o.side=="buy" and o.role in ("first_big","star_buy","avg_buy"):
+            q=int(o.qty*scale)
+            if q>0: out.append(Order(o.side,o.kind,o.price,q,o.tag,role=o.role))
+        else: out.append(o)
+    for o in orders:
+        if o.role=="extra_buy": out.append(o)
+    return out
+
+def run_voltgt(df, mode="PURE", ticker=None, split=None, seed=None, compound=None, fee=None, warmup=None):
+    ticker=ticker or TICKER; split=split or SPLIT; seed=seed or SEED
+    compound=COMPOUND if compound is None else compound; fee=FEE_RATE if fee is None else fee
+    warmup=WARMUP if warmup is None else warmup
+    cvals=df["Close"].values; highs=df["High"].values; lows=df["Low"].values; dates=list(df.index)
+    rv=rv_series(df["Close"]).values; n=len(df)
+    st=State(ticker,split,seed,seed,0,0.0,0.0,prev_close=None,closes=[])
+    yr_realized=defaultdict(float); realized_cum=0.0; tax_cum=0.0
+    n_cycle=n_reverse=0; nav_series=[]; nav_low=[]; profit_pool=0.0; inv_sum=0.0; active=idle=0
+    for i in range(n):
+        close=float(cvals[i]); high=float(highs[i]); low=float(lows[i]); yr=dates[i].year
+        if i<warmup:
+            st.closes=(st.closes+[close])[-10:]; st.prev_close=close
+            if len(st.closes)>=5: st.close5_avg=_round2(sum(st.closes[-5:])/5)
+            nav_series.append(st.balance); nav_low.append(st.balance); continue
+        scale=1.0
+        if mode in ("A","B") and not np.isnan(rv[i]) and rv[i]>0:
+            scale=min(1.0, VOLTGT_TARGET/rv[i])
+        if mode=="A" and scale<1.0:
+            rb=st.balance; st.balance=rb*scale
+            orders=suggest_orders(st) if st.prev_close is not None else []
+            st.balance=rb
+        else:
+            orders=suggest_orders(st) if st.prev_close is not None else []
+            if mode=="B" and scale<1.0: orders=_scale_orders(orders,scale)
+        fills=judge_fills(orders,high,low,close)
+        ab=st.avg; rt=0.0
+        for f in fills:
+            if f.role in ("quarter_sell","tp_sell","rev_first_sell","rev_sell") and ab>0:
+                rt+=f.qty*(f.price-ab)
+            rt-=f.price*f.qty*fee
+        yr_realized[yr]+=rt; realized_cum+=rt
+        res=update_state(st,fills,close); st.balance-=sum(f.price*f.qty*fee for f in fills)
+        for ev in res.events:
+            if "사이클종료" in ev: n_cycle+=1
+            if "리버스전환" in ev: n_reverse+=1
+        if any("사이클종료" in e for e in res.events):
+            if compound: ns=st.balance
+            else: profit_pool+=(st.balance-seed); ns=seed
+            start_new_cycle(st,ns)
+        if i==n-1 or (i+1<n and dates[i+1].year!=yr):
+            g=yr_realized[yr]; tx=max(0.0,g-TAX_DEDUCT)*TAX_RATE
+            if tx>0:
+                if not compound and profit_pool>=tx: profit_pool-=tx
+                else: st.balance-=tx
+                tax_cum+=tx
+        extra=profit_pool if not compound else 0.0
+        nav=st.balance+st.shares*close+extra
+        nav_series.append(nav); nav_low.append(st.balance+st.shares*low+extra)
+        if st.shares>0: active+=1
+        else: idle+=1
+        if nav>0: inv_sum+=(st.shares*close)/nav
+    class R: pass
+    r=R(); r.nav=nav_series; r.nav_low=nav_low; r.dates=dates
+    r.realized=realized_cum; r.tax_paid=tax_cum; r.n_cycle=n_cycle; r.n_reverse=n_reverse
+    r.invested=inv_sum/max(1,active+idle); return r
+
+def print_voltgt(df):
+    rv=rv_series(df["Close"])
+    print("\n"+"="*82)
+    print(f"  VOLTGT 실험 — 순수무매 vs A(unit축소·T지연) vs B(수량만축소)")
+    print(f"  RV 중앙 {rv.median()*100:.0f}% / 목표 {VOLTGT_TARGET*100:.0f}% / scale<1 비율 {(np.minimum(1,VOLTGT_TARGET/rv.dropna())<1).mean()*100:.0f}%")
+    print("="*82)
+    print(f"{'방식':<8}{'최종NAV':>14}{'CAGR':>8}{'MDD장중':>10}{'샤프':>7}{'사이클':>8}{'리버스':>7}{'투자%':>7}")
+    print("-"*82)
+    base=None
+    for mode in ["PURE","A","B"]:
+        r=run_voltgt(df,mode=mode)
+        cg,md,sh=metrics(r.nav,r.dates,SEED,r.nav_low)
+        if mode=="PURE": base=(cg,md)
+        tag=""
+        if mode!="PURE": tag=f"  (MDD {(md-base[1])*100:+.1f}%p, CAGR {(cg-base[0])*100:+.1f}%p)"
+        print(f"{mode:<8}{r.nav[-1]:>14,.0f}{cg*100:>7.1f}%{md*100:>9.1f}%{sh:>7.2f}{r.n_cycle:>8}{r.n_reverse:>7}{r.invested*100:>6.0f}%{tag}")
+    print("="*82)
+    print("  A=변동성 클 때 매수규모↓+진행도 느려짐 / B=규모만↓ / +값이면 순수무매보다 개선")
+    print("="*82)
+
+
+def print_voltgt_multi(df_full, start_dates):
+    """각 시작일마다 PURE vs A vs B의 MDD·CAGR 비교 (VOLTGT 일관성 확인)."""
+    print("\n"+"="*116)
+    print(f"  VOLTGT 다중 시작일 — 각 시점에서 MDD 개선 일관성 (목표변동성 {VOLTGT_TARGET*100:.0f}%)")
+    print("="*116)
+    print(f"{'시작일':<12}{'PURE CAGR':>11}{'PURE MDD':>10} |{'A CAGR':>9}{'A MDD':>9}{'AΔMDD':>8}{'A샤프':>7} |"
+          f"{'B CAGR':>9}{'B MDD':>9}{'BΔMDD':>8}{'B샤프':>7}")
+    print("-"*116)
+    data_start=df_full.index[0]; seen=set()
+    for sd in start_dates:
+        eff=max(pd.Timestamp(sd),data_start)
+        if eff in seen: continue
+        seen.add(eff)
+        sub=df_full[df_full.index>=eff]
+        if len(sub)<WARMUP+30: continue
+        rows={}
+        for mode in ["PURE","A","B"]:
+            r=run_voltgt(sub,mode=mode)
+            cg,md,sh=metrics(r.nav,r.dates,SEED,r.nav_low)
+            rows[mode]=(cg,md,sh)
+        pc,pm,ps=rows["PURE"]; ac,am,ash=rows["A"]; bc,bm,bsh=rows["B"]
+        print(f"{sd:<12}{pc*100:>10.1f}%{pm*100:>9.1f}% |{ac*100:>8.1f}%{am*100:>8.1f}%"
+              f"{(am-pm)*100:>+7.1f}{ash:>7.2f} |{bc*100:>8.1f}%{bm*100:>8.1f}%{(bm-pm)*100:>+7.1f}{bsh:>7.2f}")
+    print("="*116)
+    print("  ΔMDD: + 면 VOLTGT가 낙폭 개선(얕아짐). 모든 시작일서 +면 일관된 효과.")
+    print("  샤프 PURE 대비 오르면 위험조정수익 개선 = VOLTGT 채택 근거.")
+    print("="*116)
+
 # ═══ [실행] ═══
 print("="*70)
 print(f"  무한매수법 V4.0 — {TICKER} {SPLIT}분할, 시드 ${SEED:,.0f}, {'복리' if COMPOUND else '단리'}")
@@ -571,7 +727,11 @@ import yfinance as yf
 df = yf.download(TICKER, start=DATA_START, end=DATA_END, auto_adjust=True, progress=False)
 if hasattr(df.columns,"levels"): df.columns=[c[0] for c in df.columns]
 df = df[["Open","High","Low","Close"]].dropna()
-print(f"  데이터: {df.index[0].date()} ~ {df.index[-1].date()} ({len(df)}일)")
+print(f"  데이터(실 {TICKER}): {df.index[0].date()} ~ {df.index[-1].date()} ({len(df)}일)")
+
+if START_DATES:
+    run_multi(df, START_DATES)
+    print()
 
 r = run_backtest(df, ticker=TICKER, split=SPLIT, seed=SEED, compound=COMPOUND, fee=FEE_RATE, warmup=WARMUP)
 cagr, mdd, sharpe = metrics(r.nav, r.dates, SEED, r.nav_low)
@@ -590,12 +750,12 @@ print(f"  TQQQ 보유(세후) : ${bh:,.0f}   ({bh/SEED*100-100:+.0f}%)")
 print(f"  TQQQ MDD        : {tqqq_mdd*100:.1f}%")
 print("="*70)
 
-# ── 진단 리포트 ──
+# ── 진단 ──
 d = r.diag; total = d["days_active"]+d["days_idle"]
 idle_pct = d["days_idle"]/max(1,total)*100
 fail_pct = d["first_buy_fail"]/max(1,d["first_buy_attempt"])*100
 print("\n" + "="*70)
-print("  진단 — 저조함이 정당한지 vs 버그인지")
+print("  진단")
 print("="*70)
 print(f"  현금 방치(빈 기간) : {d['days_idle']}일 / {total}일 ({idle_pct:.1f}%)   [20%↑면 문제]")
 print(f"  평균 투자 비율     : {d.get('invested_frac_avg',0)*100:.1f}%   [무매 보통 40~70%]")
@@ -604,28 +764,26 @@ print(f"  리버스모드 일수    : {d['reverse_days']}일 ({d['reverse_days']
 cl = d.get("cycle_lengths",[])
 if cl: print(f"  사이클 길이(일)    : 평균 {np.mean(cl):.0f} / 중앙 {np.median(cl):.0f} / 최대 {max(cl)} (n={len(cl)})")
 print("-"*70)
-if idle_pct>20: print(f"  ⚠ 현금 방치 {idle_pct:.0f}% — 사이클이 충분히 안 돎.")
-if fail_pct>40: print(f"  ⚠ 처음매수 미체결 {fail_pct:.0f}% — ×{1+FIRST_PREMIUM:.2f} 프리미엄이 상승장서 높아 진입 지연. FIRST_PREMIUM↓ 실험.")
-if idle_pct<=20 and fail_pct<=40: print(f"  ✅ 사이클 정상 회전 — 저조함은 세금·벤치마크(TQQQ 강세장) 탓, 버그 아님.")
+if idle_pct<=20 and fail_pct<=40: print(f"  ✅ 사이클 정상 회전 — 저조함은 세금·벤치마크(TQQQ 강세장) 탓.")
+else:
+    if idle_pct>20: print(f"  ⚠ 현금 방치 {idle_pct:.0f}%")
+    if fail_pct>40: print(f"  ⚠ 처음매수 미체결 {fail_pct:.0f}%")
 print("="*70)
+
+# ── VOLTGT 비교 ──
+if RUN_VOLTGT:
+    print_voltgt(df)
+    if START_DATES:
+        print_voltgt_multi(df, START_DATES)
 
 # ── 차트 ──
 import matplotlib.pyplot as plt
 fig,(a1,a2)=plt.subplots(2,1,figsize=(13,8),gridspec_kw={"height_ratios":[3,1]},sharex=True)
 s=pd.Series(r.nav,index=r.dates); tq=SEED/float(df["Close"].iloc[0])*df["Close"]
-a1.set_title(f"MuMe V4 - {TICKER} {SPLIT}split vs TQQQ-hold (seed ${SEED:,.0f}, {'compound' if COMPOUND else 'simple'})")
+a1.set_title(f"MuMe V4 - {TICKER} {SPLIT}split vs TQQQ-hold (real TQQQ, {'compound' if COMPOUND else 'simple'})")
 a1.plot(s.index,s,lw=1.8,color="crimson",label=f"V4 (CAGR {cagr*100:.1f}%, MDD {mdd*100:.1f}%)")
 a1.plot(tq.index,tq,lw=1.0,color="steelblue",ls=":",label=f"TQQQ-hold (MDD {tqqq_mdd*100:.1f}%)")
 a1.set_yscale("log"); a1.set_ylabel("NAV ($,log)"); a1.legend(); a1.grid(alpha=0.3)
 dd=(s/s.cummax()-1)*100
 a2.fill_between(dd.index,dd,0,color="crimson",alpha=0.3); a2.set_ylabel("Drawdown(%)"); a2.grid(alpha=0.3)
 plt.tight_layout(); plt.show()
-
-# ═══ [선택] 자가검증 — SELFCHECK=True ═══
-SELFCHECK = False
-if SELFCHECK:
-    print("\n자가검증:")
-    st=State("TQQQ",40,100000,100000,100,50.0,0)
-    for T,exp in {1:14.25,20:0.0,40:-15.0}.items():
-        st.T=T; print(f"  별%(T={T}): {star_pct(st)*100:+.2f}% [기대 {exp:+.2f}%]")
-    st.T=1; print(f"  별지점(평단$50,T=1): ${star_price(st):.2f} [기대 $57.13]")
