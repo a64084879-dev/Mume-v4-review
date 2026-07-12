@@ -1,76 +1,351 @@
-자기 감사하겠습니다. 파일을 디스크에 올리고 기계적 검사부터 돌립니다.Static verification of both files against the bot/adapter surfaceStatic verification of both files against the bot/adapter surface문법은 통과. 이제 논리 검증 — 가드가 실제로 막는지 시뮬레이션으로 확인합니다.명령 2개 실행함명령 2개 실행함가드가 뚫렸습니다. 시뮬레이션이 증명합니다:
-시나리오결과A ovrs_pdno ✅ 있는데 ovrs_cblc_qty만 이름 다름가드 통과 → get_holdings=0주 → "🔵 실보유 0 확인 — CASH 확정" ← 3000주 그대로 있는데 대피 완료로 기록. 막으려던 무음실패가 그대로 재현B pdno ✅ 있는데 nccs_qty만 이름 다름가드 통과 → list_open_orders=[] → cancel-first 통과 → 이중 사다리C ord_dt 이름 다름가드 발동 — 단 우연히. 진단명은 "ccnl 다행"인데 실제 원인은 ord_dt 누락
-원인: _EXPECT가 식별자 필드(pdno)만 검사하고 수량 필드를 안 봤습니다. 그런데 무음실패를 만드는 건 수량 필드입니다. 어댑터가 실제로 dereference 하는 건:
-balance : ovrs_pdno, ovrs_cblc_qty, pchs_avg_pric
-nccs    : pdno, odno, nccs_qty, sll_buy_dvsn_cd, ft_ord_unpr3
-ccnl    : pdno, odno, ft_ccld_qty, ft_ccld_unpr3, sll_buy_dvsn_cd, ord_dt
-ord_dt가 특히 중요합니다. sync_fills의 dedup 키가 {filled_at}:{odno}:{side}인데, KIS ODNO는 일자별 채번입니다. ord_dt가 누락되면 filled_at="" → 다른 날 같은 번호 주문이 키 충돌 → delta 음수 → 체결 유실.
-수정 후 재검증:Patch _EXPECT to cover all dereferenced fields and re-run the three scenariosPatch _EXPECT to cover all dereferenced fields and re-run the three scenarios가드가 수정 후 3건 모두 정상 발동합니다 (A는 이제 INVESTED 유지 + evac_pending + 🚨🚨).
-이제 발견 사항 전체를 정리하고 두 파일을 고쳐 다시 냅니다.
+# -*- coding: utf-8 -*-
+"""
+vr_auto_runner_kis.py — vr_signal_bot <-> vr_kis_adapter 글루 [KIS 전용]  rev.3
+════════════════════════════════════════════════════════════════════════
+★ 불가침 (한 글자도 수정하지 않는다) ★
+    vr_signal_bot.py      공통 신호 계층   완성·검증
+    vr_broker_adapter.py  공통 프레임워크  완성·검증
+    vr_kis_adapter.py     한투 어댑터      완성·검증
+    vr_toss_adapter.py    토스 어댑터      완성·검증
+    vr_kiwoom_adapter.py  키움 어댑터      완성·검증
+  이 러너는 '새 파일'이며, 위 다섯을 import·상속만 한다.
 
-🔴 치명 3건 (내 코드의 결함)
-F1. 스키마 가드가 정작 위험한 필드를 안 본다 — 위 시나리오 A/B로 실증. 식별자(pdno)만 보고 수량 필드를 안 봐서, 가드가 막겠다고 선언한 두 실패(킬스위치 무음실패·이중 사다리)가 그대로 통과했습니다.
-F2. ord_dt 누락 위험 미검사 — KIS ODNO는 일자별 채번이라, filled_at=""이 되면 다른 날 같은 번호가 dedup 키에서 충돌 → 체결 유실. 덤으로 sync_fills의 프루닝(k.split(":")[0])도 빈 문자열이 되어 fills_seen이 무한 증가합니다.
-F3. preflight _row_structure가 ODNO만으로 중복 판정 — P5는 14일 창을 조회하는데 ODNO는 일자별 채번 → 다른 날 같은 ODNO를 "주문당 다행 🔴🔴"으로 오탐. 러너 쪽은 ord_dt:odno로 맞게 짰는데 preflight만 틀려서, 두 도구의 판정이 서로 어긋납니다.
-🟠 중대 4건
-F4. DRY_RUN=on은 KIS를 아무것도 테스트하지 않는다 — G2가 공회전.
-sync_fills·reconcile·rotate_cycle이 전부 if dry_run: return → get_holdings/list_open_orders/get_fills 한 번도 호출 안 됨 → 스키마 가드가 단 한 번도 발동하지 않습니다. 제가 설계한 G2 게이트는 봇 원본이 이미 하던 일만 반복하는 셈이었습니다. → 조회 전용 probe 필요.
-F5. 프리플라이트 체결이 러너 첫 실행에 빨려들어간다. since=rolling_since(5) 창 안에 preflight의 1주 매수/매도가 들어 있어 첫 sync_fills가 그걸 포지션에 반영합니다. → SYNC_SINCE 하한 필요.
-F6. 기존 07:37 크론을 끄지 않으면 AUTO_MODE 가드가 무력. 가드는 러너의 monkeypatch입니다. vr_signal_bot.py가 자기 크론으로 계속 돌면 **패치 안 된 apply_command**가 /buy를 그대로 받습니다 → 이중반영. 게다가 두 프로세스가 vr_position.json·offset 파일을 동시에 씁니다. 기존 워크플로 삭제가 전제조건입니다 (코드로 못 막습니다).
-F7. preflight P13 판정 오염. P10 매수가 20초 내 미체결이면 보유 0 → P13 매도는 잔고부족으로 거부 → SLL_TYPE=00 🔴 거부로 오판정.
-🟡 정합성 질문 1건 — 답이 필요합니다
-F8. 확정 스펙은 LOC인데, 코드는 LOC를 한 번도 호출하지 않습니다.
-_place_ladder      → OrderReq(..., "LIMIT", ...)   하드코딩
-killswitch_evacuate → "LIMIT"
-recover_enter       → "LIMIT"
-→ 어댑터의 _ord_dvsn LOC(34)/MOC(33)/MOO(31) 매핑은 호출자가 없는 데드코드입니다. "LOC 채택 확정"과 "지정가 사다리 실행"이 병존합니다. 어느 쪽이 확정인지 확인이 필요하고, 만약 LOC가 맞다면 실전 전환 시 LOC 경로가 단 한 번도 검증 안 된 채 처음 쓰이게 됩니다(모의는 ORD_DVSN=00만 지원).
+★ 트랙 정리 (2026-07-12 확정) ★
+  · 자동화 트랙 = 사다리 단일화. 어댑터 체인 전체(DAY 매일 fresh 재배치,
+    budget_override, cancel-first, 예약주문)가 사다리 전제로 설계·검증됨.
+  · LOC는 별개 트랙(수동 신호)의 결정이었고, 자동화로 그 이유가 소멸.
+    백테스트 <0.33%는 'LOC 우위'가 아니라 '사다리 기준 LOC 동등성' 검증.
+  · 어댑터의 ORD_DVSN 34(LOC) 매핑은 데드코드가 아니라 대피·복귀용 예약분.
+  · OrderReq.order_kind로 주문종류가 이미 어댑터 계층에 분리돼 있음.
+  → 주문 종류에 대해 이 러너는 아무것도 바꾸지 않는다.
 
-수정본:명령 2개 실행함, 파일 읽음명령 2개 실행함, 파일 읽음rev.2 반영 내역
-수정F1_EXPECT를 어댑터가 실제 dereference 하는 필드 전부로 확장 (ovrs_cblc_qty, nccs_qty, ft_ccld_qty 포함). 시나리오 A/B 재검증 → 이제 🚨🚨 + INVESTED 유지F2ord_dt를 _EXPECT["fills"]·preflight 가정 필드에 필수 포함F3preflight 행구조 판정을 (ord_dt, odno) 복합키로 — 러너의 dedup 키와 일치. ord_dt 부재 시 별도 🔴 경보F4probe() 추가 — DRY에서도 get_price/get_holdings/list_open_orders/get_fills를 실제로 호출. G2가 비로소 스키마 가드를 발동시킴F5SYNC_SINCE 하한 옵션 (프리플라이트 체결 차단)F7preflight P13이 보유 0이면 ⚪ 스킵 (잔고부족을 SLL_TYPE 거부로 오판 방지)🟢알림 버퍼링(경보는 즉시, 나머지는 리포트에 합류) / P3가 어댑터 실제 파라미터(unpr=0) 시험 / USD 예수금 0 조기경보
+★ KIS 전용 ★ GuardedKIS의 스키마 가드가 KIS 응답 필드명에 묶여 있다.
+  한투 = 모의 검증 전용. 실전은 토스·키움.
+  토스/키움 러너는 make_broker() + GuardedXXX만 교체(핵심 로직은 증권사 무관).
+  단 스키마 가드는 해당 증권사 필드가 '실측 확정'된 뒤에만 작성 가능.
 
-은박사님 결정이 필요한 2건 — 코드로 못 막습니다
-F6. 기존 07:37 크론. AUTO_MODE 가드는 러너의 monkeypatch입니다. vr_signal_bot.py가 자기 워크플로로 계속 돌면 **패치 안 된 apply_command**가 /buy를 그대로 받고, 두 프로세스가 vr_position.json을 동시에 씁니다.
-→ 선택: (a) 기존 워크플로 삭제 (권장, 러너가 리포트도 보냄) 또는 (b) 봇에 3줄 이식(봇 무수정 원칙 파기). (a)를 권합니다.
-F8. LOC vs 지정가 사다리. _place_ladder·killswitch_evacuate·recover_enter 전부 order_kind="LIMIT" 하드코딩 → 어댑터의 LOC(34)/MOC(33)/MOO(31) 매핑은 호출자가 없는 데드코드입니다. 확정 스펙("LOC 채택")과 실행 코드가 어긋나 있습니다.
-→ 어느 쪽이 확정인지 알려주시면 정리하겠습니다. LOC가 맞다면, 모의는 ORD_DVSN=00만 지원하므로 LOC 경로는 실전 전환 때 처음 실행됩니다 — 게이트에 "실전 1주로 LOC(34) 실측" 항목을 추가해야 합니다.
+━━ 러너가 봉합하는 것 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ [G1] 스키마 가드 — 어댑터가 실제로 .get() 하는 필드를 '전부' 검사.
+      어댑터의 예외전파는 rt_cd≠0만 막는다. '200 OK인데 필드명이 다른 경우'는
+      조용히 0/[]로 떨어진다. 그 필드들이 지금 [부분확인]이다.
+        · ovrs_cblc_qty 오인 → get_holdings=0주 → killswitch "실보유 0 확인 —
+          CASH 확정" → 주식 그대로인데 대피 완료 기록 (무음실패)
+        · nccs_qty 오인 → list_open_orders=[] → cancel-first 통과 → 이중 사다리
+        · ord_dt 오인 → sync_fills dedup 키 붕괴. KIS ODNO는 '일자별 채번'이라
+          filled_at="" 이면 다른 날 같은 번호끼리 충돌 → 체결 유실
+      ※ rev.1 자기감사에서 '식별자(pdno)만 검사' 버전이 위 두 실패를 그대로
+        통과시키는 것을 시뮬레이션으로 실증 → 수량 필드까지 확장.
 
-게이트 (rev.2)
-G0  python kis_mock_preflight.py            아무때나   조회 필드 확정
-G1  python kis_mock_preflight.py --order    ★미국장★  ord_dt·행구조·SLL_TYPE·보유매치
-    ↓ 🔴 0건 확인 후에만
-G2  DRY_RUN=on  vr_auto_runner_kis.py       아무때나   probe가 스키마 가드 발동 + 사다리 예고
-G3  DRY_RUN=off AUTO_MODE=on  크론 23:40    2주 1사이클  매일 reconcile 통과
-G3 진입 전 SYNC_SINCE를 G1 다음날로 설정하고, 모의계좌 잔고를 정리한 뒤 /setpos로 실제 상태를 등록하십시오. 그러지 않으면 프리플라이트 테스트 체결이 첫 sync에 흡수됩니다.
-G0 원문 덤프 주시면 필드 확정하겠습니다.알겠습니다. 코드 없이 조언만 드립니다.
-지금 상태 한 줄 요약
-어댑터·프레임워크·봇은 다 있는데 셋을 잇는 러너가 없습니다. 그리고 KIS 응답 필드 6종이 아직 [부분확인]이라, 그 상태로 배선하면 필드명 하나 틀린 것만으로 킬스위치가 조용히 실패합니다(get_holdings가 0주 반환 → "실보유 0 확인 — CASH 확정"). 이게 최우선 리스크입니다.
-순서
-1. 먼저 필드 실측. 코드 짜기 전에, 모의계좌에서 잔고·미체결·체결·매수가능 응답을 원문 그대로 한 번 받아보십시오. 어댑터를 통해 조회하면 안 됩니다 — 틀린 가정이 0이나 빈 리스트로 은폐됩니다. 확인할 것:
+ [G2] AUTO_MODE — 체결보고성 명령 거부.
+      apply_command '/buy'와 sync_fills가 둘 다 shares/pool/cyc_used를 건드린다.
+      자동 켠 채 /buy 보내면 같은 체결이 2번 반영.
 
-잔고: 종목코드 필드와 수량 필드 (수량 필드가 핵심입니다. 종목코드만 맞고 수량 필드가 틀리면 0주 → 무음실패)
-미체결: 종목·주문번호·미체결수량 (수량 필드 틀리면 빈 리스트 → cancel-first 통과 → 이중 사다리)
-체결: 수량·단가·주문일자 + 행구조
-매수가능: 단가를 0으로 넣어도 받는지
+ [G3] 실행순서 — sync_fills를 rollover보다 먼저.
+      'rollover → sync' 순이면 사이클 마지막 세션에 체결이 난 날:
+        ① 체결 반영 전 pool로 V=V+pool/G → V 왜곡
+        ② 같은 stale pool로 cyc_budget 스냅샷 + cyc_used=0 리셋
+        ③ 직후 sync가 구사이클 체결 cost를 새 cyc_used에 적재 → 매수한도 선소진
+      sync_fills는 fills_seen 멱등 → 먼저 1회 호출해도 daily_run 내부 2차 sync는 no-op.
 
-2. 체결 행구조가 최대 관문. sync_fills는 "주문 하나당 1행, 수량은 누계"를 전제합니다. 만약 체결 건별로 여러 행이 오면 두 번째 행부터 델타가 음수가 되어 그냥 버려집니다 → 주수 과소 → reconcile 불일치 → 봇이 매일 멈춥니다. 부분체결이 흔한 사다리에선 치명적입니다.
-3. 주문번호는 일자별 채번입니다. 체결 dedup 키가 날짜:주문번호인데 날짜 필드가 누락되면 다른 날 같은 번호끼리 충돌합니다. 날짜 필드를 반드시 확인하십시오.
-설계 결정 3가지
-예약주문 쓰지 마십시오(모의 단계에선). 모의는 예약주문 조회를 지원하지 않습니다. 걸린 예약을 API로 확인할 방법이 없고 로컬 파일이 유일한 진실원이 됩니다. 검증 단계에서 검증 불가능한 경로를 쓰면 안 됩니다. 정규주문은 미체결·체결·잔고 조회가 다 되므로 필드를 전부 실측할 수 있습니다. 예약은 필드 확정 후 별도로.
-크론을 밤으로 옮기십시오. 정규주문은 미국장 중에만 접수됩니다. 07:37은 마감 후라 주문이 전량 거부됩니다. 신호 기준일(마지막 미국 종가)은 아침이든 밤이든 동일하므로, 23:40 KST 단일 크론으로 신호+주문을 통합하면 됩니다.
-기존 신호봇 크론은 반드시 끄십시오. 이건 코드로 못 막습니다. 자동매매를 켠 상태에서 옛 봇이 계속 돌면, 습관대로 보낸 /buy가 옛 봇에서 그대로 처리되어 같은 체결이 두 번 반영됩니다(수동 명령 + 자동 sync). 두 프로세스가 포지션 파일을 동시에 쓰는 문제도 있습니다.
-러너를 짤 때 반드시 지킬 것
+ [G4] 프로브 — DRY에서도 조회를 실제로 태운다.
+      dry_run이면 sync_fills/reconcile/rotate_cycle이 전부 `if dry_run: return`
+      → get_holdings·list_open_orders·get_fills가 한 번도 호출되지 않는다
+      → 스키마 가드가 발동할 기회가 없다 → DRY가 KIS를 아무것도 검증 못 한다.
 
-체결동기화를 사이클 롤오버보다 먼저. 반대로 하면 사이클 마지막날 체결이 난 경우, 체결 반영 전 pool로 V와 매수한도를 스냅샷한 뒤 곧바로 구사이클 체결이 새 사이클 한도를 깎아먹습니다.
-자동매매 모드에선 체결보고 명령(/buy /sell /exit /enter 등)을 거부. 진실원은 하나여야 합니다.
-DRY 모드는 아무것도 검증하지 못합니다. 동기화·리컨실·주문취소가 전부 스킵되므로 KIS 조회가 한 번도 안 일어납니다. DRY에서도 조회 4종은 실제로 태워야 의미가 있습니다.
+━━ rev.3 수정 (rev.2 자기감사) ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ [R1] 🔴 STRICT_CCNL 오탐. rev.2는 ccnl '모든 행'을 세어 중복을 판정했는데,
+      어댑터는 모의에서 CCLD_NCCS_DVSN="00"(전체)로 조회한다 → 미체결 행이 섞여
+      온다. 같은 주문이 미체결행+체결행으로 나뉘면 (일자,ODNO) 키가 겹쳐
+      '주문당 다행'으로 오판 → 첫 체결이 나는 날 봇이 정지한다.
+      → 어댑터가 '실제로 채택하는 행'(해당 심볼 + 체결수량>0)만 대상으로 좁힘.
+ [R2] 🟠 텔레그램 4096자. rev.2는 프로브+버퍼+명령결과+리포트를 한 메시지로
+      합쳤다 → 체결 많은 날 전송 실패 → 그 안의 체결 알림이 통째로 소실.
+      → 버퍼는 '별도 메시지'로 분리 전송. 리포트가 죽어도 체결 기록은 산다.
+ [R3] 🟢 프로브의 주수 대조 결과(recon_ok)가 죽은 변수였다 → 불일치면 경보.
 
-함정 2개
+━━ 운영 전제 (코드로 막을 수 없음) ━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ ★ 기존 vr_signal_bot.py 크론(07:37)을 반드시 삭제/비활성화할 것. ★
+   AUTO_MODE 가드는 이 러너 안에서만 산다. 옛 봇이 자기 워크플로로 계속 돌면
+   패치 안 된 apply_command가 /buy를 그대로 먹고(이중반영), 두 프로세스가
+   vr_position.json·offset 파일을 동시에 쓴다. 러너가 신호+리포트+명령을 모두
+   포함하므로 옛 크론은 중복이다.
 
-프리플라이트 테스트 체결이 첫 동기화에 빨려들어옵니다. 체결조회 창이 며칠 뒤로 잡히니까요. 실주문 테스트를 했다면 모의계좌를 정리하고 조회 시작일을 잘라야 합니다.
-확정 스펙은 LOC인데 코드는 전부 지정가입니다. 사다리·킬스위치·복귀 전부 LIMIT 하드코딩이라, 어댑터의 LOC 매핑은 호출자가 없는 데드코드입니다. 어느 쪽이 확정인지 정리가 필요하고, LOC가 맞다면 모의는 LOC를 지원하지 않으므로 실전 전환 때 처음 실행되는 미검증 경로가 됩니다.
+━━ 모의 1단계 설계 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  · use_reserve=False (정규주문). 모의는 예약주문 '조회'(TTTT3039R) 미지원 →
+    걸린 예약을 API로 확인 불가. 검증 단계에서 검증 불가능한 경로는 쓰지 않는다.
+  · 크론 23:40 KST (미국 개장 직후). 정규주문은 미국장 중에만 접수된다.
+    신호 기준일(마지막 미국 종가=D-1)은 07:37이든 23:40이든 동일 → 단일 크론 통합.
 
-게이트
-조회 실측 → 실주문 1주 실측(미국장 중) → DRY(조회는 실제로) → 소액 실주문 1사이클(2주). 각 단계에서 🔴이 하나라도 남으면 다음으로 넘어가지 마십시오. 복귀는 당분간 수동(/enter)으로 두시고, 대피만 자동으로 — 비대칭이 안전 방향입니다.# -*- coding: utf-8 -*-
+━━ 환경변수 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  KIS_APPKEY / KIS_APPSECRET / KIS_CANO      (필수)
+  KIS_ACNT_PRDT_CD=01  KIS_MOCK=on  USE_RESERVE=off  KIS_SYMBOL=TQQQ
+  DRY_RUN=on        기본 ON. 주문 안 나감. 프로브는 실행(가드 검증됨).
+  AUTO_MODE=off     ON이면 체결보고 명령 거부(자동 sync가 진실원)
+  AUTO_RECOVER=off  복귀는 기본 수동(/enter). 대피만 자동 — 비대칭이 안전 방향.
+  STRICT_CCNL=on    ccnl 주문당 다행 감지 시 중단
+  SYNC_SINCE=       YYYY-MM-DD. 체결조회 시작일 하한(프리플라이트 테스트 체결 차단).
+                    rolling_since(5)가 5영업일 뒤 이 값을 넘어서면 저절로 무력화됨.
+  + TELEGRAM_TOKEN / TELEGRAM_CHAT_ID / FRED_API_KEY / HEALTHCHECK_URL
+════════════════════════════════════════════════════════════════════════
+"""
+from __future__ import annotations
+import os, traceback
+
+import vr_signal_bot as bot                    # main()은 __main__ 가드 안이라 import 안전
+from vr_broker_adapter import LadderAutomator, daily_run, rolling_since
+from vr_kis_adapter import KISAdapter, KISError
+
+ON = bot.ON
+DRY_RUN      = ON(os.environ.get("DRY_RUN", "on"))
+AUTO_MODE    = ON(os.environ.get("AUTO_MODE", "off"))
+AUTO_RECOVER = ON(os.environ.get("AUTO_RECOVER", "off"))
+USE_RESERVE  = ON(os.environ.get("USE_RESERVE", "off"))
+KIS_MOCK     = ON(os.environ.get("KIS_MOCK", "on"))
+STRICT_CCNL  = ON(os.environ.get("STRICT_CCNL", "on"))
+SYNC_SINCE   = os.environ.get("SYNC_SINCE", "").strip()
+SYMBOL       = os.environ.get("KIS_SYMBOL", "TQQQ")
+
+TG_LIMIT = 3800   # 텔레그램 단일 메시지 상한 4096 — 여유 두고 자름
+
+# 체결을 '보고'하는 명령 = sync_fills와 진실원이 겹침 → AUTO_MODE에서 거부.
+# /setpos·/setv·/setcycle·/reset 은 의도적 '수리' 명령이라 허용(틀리면 reconcile이 잡음).
+BLOCKED_IN_AUTO = {"/buy", "/sell", "/exit", "/enter", "/deposit_done", "/lumpsum_done"}
+
+
+# ══ [R2] 알림 — 경보는 즉시, 나머지는 별도 메시지로 묶어 전송 ═══════
+class Notifier:
+    URGENT = ("🚨", "🔴", "⚠", "⛔")
+    def __init__(self, sink):
+        self.sink = sink; self.buf = []
+    def __call__(self, m):
+        head = m.lstrip()[:3]
+        if any(u in head for u in self.URGENT):
+            self.sink(m)                     # 경보는 즉시 — 크래시해도 남는다
+        else:
+            self.buf.append(m)
+    def flush(self):
+        """[R2] 리포트에 합치지 않는다. 합치면 4096자 초과 시 체결 알림까지 소실."""
+        if not self.buf:
+            return
+        chunk = []
+        for m in self.buf:
+            if sum(len(x) + 1 for x in chunk) + len(m) > TG_LIMIT and chunk:
+                self.sink("\n".join(chunk)); chunk = []
+            chunk.append(m)
+        if chunk:
+            self.sink("\n".join(chunk))
+        self.buf = []
+
+
+# ══ [G1] 스키마 가드 ═══════════════════════════════════════════════
+class GuardedKIS(KISAdapter):
+    """어댑터 무수정 — 상속만 한다. 필드 계약 검증만 덧씌운다.
+
+       ★ 어댑터가 실제로 .get() 하는 필드를 '전부' 검사해야 한다.
+         식별자(pdno)만 검사하면 수량 필드가 틀렸을 때 조용히 0/[]로 떨어져,
+         가드가 막겠다고 선언한 무음실패가 그대로 재현된다(rev.1 실증)."""
+    _EXPECT = {
+        "balance":  ["ovrs_pdno", "ovrs_cblc_qty"],
+        "open_ord": ["pdno", "odno", "nccs_qty"],
+        "fills":    ["pdno", "odno", "ft_ccld_qty", "ft_ccld_unpr3", "ord_dt"],
+    }
+    # sll_buy_dvsn_cd는 어댑터가 이미 fail-fast(KISError) → 중복 검사 불필요.
+
+    def _get_paged(self, path, tr_key, params, err, list_key="output", max_pages=10):
+        rows = super()._get_paged(path, tr_key, params, err, list_key, max_pages)
+        need = self._EXPECT.get(tr_key, [])
+        if rows and need:
+            miss = [k for k in need if not any(k in r for r in rows)]
+            if miss:
+                raise KISError(
+                    f"🔴 스키마 불일치[{tr_key}]: 누락 {miss}. "
+                    f"조용한 0/[] 반환 = 킬스위치 무음실패·이중사다리 경로 → 중단. "
+                    f"실제 키={list(rows[0].keys())}")
+        if STRICT_CCNL and tr_key == "fills" and rows:
+            self._check_fill_rows(rows)
+        return rows
+
+    def _check_fill_rows(self, rows):
+        """sync_fills는 '(ord_dt:ODNO)당 누계 1행'을 전제한다.
+           체결건당 다행이면 delta<=0 → continue → 체결 유실 → shares 과소.
+
+           [R1] 어댑터는 모의에서 CCLD_NCCS_DVSN="00"(전체)로 조회한다 →
+           미체결 행이 섞여 온다. 전체 행을 세면 같은 주문의 미체결행+체결행이
+           키 충돌을 일으켜 '다행'으로 오판 → 첫 체결일에 봇 정지.
+           → 어댑터가 '실제로 채택하는 행'만 대상으로 좁힌다(get_fills와 동일 필터)."""
+        adopted = [r for r in rows
+                   if r.get("pdno") == SYMBOL
+                   and float(r.get("ft_ccld_qty", 0) or 0) > 0]
+        seen = {}
+        for r in adopted:
+            k = f"{r.get('ord_dt','')}:{r.get('odno','')}"
+            seen[k] = seen.get(k, 0) + 1
+        dup = {k: v for k, v in seen.items() if v > 1}
+        if dup:
+            raise KISError(
+                f"🔴 ccnl 주문당 다행 감지 {dup} — sync_fills의 delta dedup 전제 위반. "
+                f"체결 유실 위험 → 중단. (STRICT_CCNL=off 로 무시 가능하나 비권장)")
+
+
+# ══ [G2] AUTO_MODE 가드 ════════════════════════════════════════════
+_orig_apply = bot.apply_command
+
+def _guarded_apply(pos, text, price_hint, Veff_target=None):
+    t = (text or "").strip().split()
+    cmd = t[0].lower().split("@", 1)[0] if t else ""
+    if AUTO_MODE and cmd in BLOCKED_IN_AUTO:
+        return pos, (f"⛔ AUTO_MODE — <code>{cmd}</code> 거부.\n"
+                     f"   체결은 증권사 API로 자동 동기화됩니다(이중반영 방지).\n"
+                     f"   수동 개입이 필요하면 AUTO_MODE=off 후 실행.")
+    return _orig_apply(pos, text, price_hint, Veff_target)
+
+bot.apply_command = _guarded_apply
+
+
+# ══ [G4] 조회 전용 프로브 — DRY에서도 항상 실행 ════════════════════
+def probe(broker, pos, since, notify):
+    """DRY에서는 sync/reconcile/rotate가 전부 스킵되어 KIS 조회가 한 번도
+       일어나지 않는다 = 스키마 가드가 발동할 기회가 없다.
+       → 주문은 내지 않고 조회 4종만 실제로 태워 가드를 발동시킨다."""
+    L = ["🔍 <b>조회 프로브</b> (주문 없음)"]
+    L.append(f"   현재가 ${broker.get_price(SYMBOL):,.2f}")
+
+    held = broker.get_holdings(SYMBOL)                   # ← balance 스키마 가드
+    bs = float(pos.get("shares", 0.0))
+    ok = abs(held.shares - bs) <= 0.5
+    L.append(f"   실보유 {held.shares:g}주 vs 봇 {bs:g}주  {'✅' if ok else '불일치'}")
+
+    opens = broker.list_open_orders(SYMBOL)              # ← nccs 스키마 가드
+    L.append(f"   미체결 {len(opens)}건")
+
+    fills = broker.get_fills(SYMBOL, since)              # ← ccnl 스키마 + 행구조 가드
+    L.append(f"   체결({since}~) {len(fills)}건")
+
+    try:
+        L.append(f"   주문가능 ${broker.get_cash_usd():,.0f} "
+                 f"(Pool ${float(pos.get('pool',0)):,.0f} · 증거금 차감분이라 참고용)")
+    except Exception as e:
+        L.append(f"   주문가능 조회 생략: {e}")
+
+    notify("\n".join(L))
+    # [R3] 주수 불일치는 죽은 변수로 두지 않는다 — 경보로 올린다.
+    if not ok:
+        notify(f"🚨 포지션 불일치 — 봇 {bs:g}주 vs 실보유 {held.shares:g}주. "
+               f"reconcile이 사다리를 중단시킨다. 수동 확인 필요.")
+    return ok
+
+
+# ══ 러너 ═══════════════════════════════════════════════════════════
+def make_broker():
+    ak, sk, cano = (os.environ.get("KIS_APPKEY"), os.environ.get("KIS_APPSECRET"),
+                    os.environ.get("KIS_CANO"))
+    if not (ak and sk and cano):
+        raise SystemExit("환경변수 필요: KIS_APPKEY / KIS_APPSECRET / KIS_CANO")
+    return GuardedKIS(ak, sk, cano,
+                      acnt_prdt_cd=os.environ.get("KIS_ACNT_PRDT_CD", "01"),
+                      mock=KIS_MOCK, use_reserve=USE_RESERVE)
+
+
+def run():
+    mode = ("DRY" if DRY_RUN else "LIVE") + ("/모의" if KIS_MOCK else "/실전")
+    banner = (f"⚙️ 자동매매 {mode} · AUTO_MODE={'on' if AUTO_MODE else 'off'} · "
+              f"자동복귀={'on' if AUTO_RECOVER else 'off'} · "
+              f"예약주문={'on' if USE_RESERVE else 'off'}")
+    print(banner)
+
+    df  = bot.build_data()
+    pos = bot.load_position()
+
+    broker   = make_broker()
+    notifier = Notifier(bot._tg)
+    auto     = LadderAutomator(broker, SYMBOL, dry_run=DRY_RUN, notify=notifier)
+
+    # 체결조회 창 하한 — 프리플라이트 테스트 체결이 빨려들어오는 것 차단
+    since = rolling_since(5)
+    if SYNC_SINCE and SYNC_SINCE > since:
+        since = SYNC_SINCE
+        notifier(f"ℹ️ SYNC_SINCE={SYNC_SINCE} 적용 (5영업일 뒤 자동 해제)")
+
+    # ① [G4] 프로브 — DRY 포함 항상. 스키마 가드가 여기서 발동한다.
+    probe(broker, pos, since, notifier)
+
+    # ② [G3] sync_fills 먼저 (구사이클 pool 확정).
+    #    DRY면 어차피 no-op → 스킵(중복 알림 방지).
+    if not DRY_RUN:
+        try:
+            pos = auto.sync_fills(pos, since)
+            bot.save_position(pos)
+        except Exception as e:
+            bot._tg(f"🚨 체결동기화 실패 — 이후 단계 중단(안전): {e}")
+            notifier.flush()
+            raise
+
+    px_col = "TQQQ_REAL" if ("TQQQ_REAL" in df.columns and
+                             not bot.pd.isna(df["TQQQ_REAL"].iloc[-1])) else "TQQQ"
+    price_hint = float(df[px_col].iloc[-1])
+
+    # ③ ensure_V → rollover (체결 반영된 pool로 V·cyc_budget 스냅샷)
+    pos = bot.ensure_V(pos, price_hint)
+    pos, roll_msg, cycle_changed = bot._cycle_rollover(pos, df)
+    if cycle_changed:
+        bot.save_position(pos)
+
+    # ④ 명령 처리 (AUTO_MODE면 체결보고 명령 거부)
+    V_tmp = pos.get("V", 0.0) or (pos.get("shares", 0.0) * price_hint)
+    if ON(bot.VOLTGT_ON) and pos.get("cyc_scale") is not None:
+        scale = float(pos["cyc_scale"])
+    else:
+        rv = float(df["RV"].iloc[-1]) if not bot.pd.isna(df["RV"].iloc[-1]) else float("nan")
+        scale = (min(1.0, bot.VOLTGT_TARGET / rv)
+                 if (ON(bot.VOLTGT_ON) and rv == rv and rv > 0) else 1.0)
+    pos, cmd_results = bot.process_commands(pos, price_hint, V_tmp * scale)
+
+    if pos.get("shares", 0) == 0 and pos.get("pool", 0) == 0 and not cmd_results:
+        notifier.flush()
+        bot._tg("⚠️ 포지션 미등록 — <code>/setpos</code> 먼저. 자동매매 스킵.")
+        return
+
+    # ⑤ daily_run — 내부 sync는 멱등 no-op. compute_ladder 필수(DAY-only 브로커).
+    pos = daily_run(auto, pos, bot.compute_signal, df, since, bot.save_position,
+                    auto_recover=AUTO_RECOVER, compute_ladder=bot.compute_ladder)
+
+    # ⑥ [R2] 버퍼 알림 먼저 별도 전송 — 리포트가 길어 죽어도 체결 기록은 산다.
+    notifier.flush()
+
+    # ⑦ 리포트 (daily_run이 중간 return해도 항상 발송)
+    s = bot.compute_signal(df, pos)
+    head = [banner]
+    if cmd_results:
+        head.append("✅ <b>처리된 명령</b>")
+        head += [f"   • {r}" for r in cmd_results]
+    if roll_msg:
+        head.append(f"🔄 {roll_msg}")
+    report = "\n".join(head) + "\n\n" + bot.build_report(s, df)
+
+    if bot._tg(report):
+        bot._save_last(str(s["today"].date()))
+        bot._ping()
+        if s.get("is_cycle_start"):
+            pos["ladder_placed_for"] = str(s["cyc_start"]); bot.save_position(pos)
+        rcd = s.get("recover_check_date")
+        recovering = bool(s.get("ks_recover")) or (s.get("action_ks") == "🔵 복귀")
+        if rcd and not recovering and rcd != pos.get("last_recover_check", ""):
+            pos["last_recover_check"] = rcd; bot.save_position(pos)
+    else:
+        print("[경고] 텔레그램 전송 실패"); print(report)
+
+
+if __name__ == "__main__":
+    try:
+        run()
+    except Exception as e:
+        bot._emergency_tg(e)
+        print(f"[크래시] {e}"); traceback.print_exc()
+        raise     
+
+
+
+# -*- coding: utf-8 -*-
 """
 kis_mock_preflight.py — KIS 모의투자 '필드 실측기'
 ════════════════════════════════════════════════════════════════════════
@@ -463,293 +738,123 @@ if __name__ == "__main__":
 
 
 
-    # -*- coding: utf-8 -*-
-"""
-vr_auto_runner_kis.py — vr_signal_bot <-> vr_kis_adapter 글루 [KIS 전용]  rev.2
-════════════════════════════════════════════════════════════════════════
-봇은 어댑터를 import하지 않는다(설계). 이 파일이 유일한 접점.
-vr_signal_bot.py / vr_broker_adapter.py / vr_kis_adapter.py 는 무수정.
-
-★★ KIS 전용 ★★ 스키마 가드가 KIS 응답 필드명에 묶여 있다.
-   토스/키움은 make_broker() + GuardedXXX 서브클래스만 교체(핵심 로직은 증권사 무관).
-   단 스키마 가드는 해당 증권사 필드가 '실측 확정'된 뒤에만 작성 가능(추측이면 무의미).
-
-━━ rev.2 수정 (rev.1 자기감사에서 실증된 결함) ━━━━━━━━━━━━━━━━━━━━━━━
- [F1] 🔴 스키마 가드가 식별자(pdno)만 보고 '수량 필드'를 안 봤다.
-      재현: ovrs_pdno는 맞고 ovrs_cblc_qty만 이름이 다르면 →
-            가드 통과 → get_holdings=0주 → killswitch "🔵 실보유 0 확인 — CASH 확정"
-            → 3000주 보유 중인데 대피 완료로 기록(막으려던 무음실패 그대로 재현).
-      동일하게 nccs_qty만 틀리면 → list_open_orders=[] → cancel-first 통과 → 이중 사다리.
-      → _EXPECT를 '어댑터가 실제로 dereference 하는 필드 전부'로 확장.
- [F2] 🔴 ord_dt 미검사. sync_fills dedup 키 = {filled_at}:{odno}:{side} 인데
-      KIS ODNO는 '일자별 채번' → ord_dt 누락 시 filled_at="" → 다른 날 같은 번호가
-      키 충돌 → delta 음수 → 체결 유실. 프루닝(k.split(":")[0])도 무력화 → seen 무한증가.
-      → ord_dt를 _EXPECT["fills"]에 필수 포함.
- [F4] 🟠 DRY_RUN=on이 KIS를 하나도 검증하지 않았다.
-      sync_fills/reconcile/rotate_cycle 전부 `if dry_run: return` → get_holdings·
-      list_open_orders·get_fills 미호출 → 스키마 가드가 한 번도 발동 안 함.
-      → probe(): 주문 없이 조회 4종만 실제로 태운다. DRY에서도 항상 실행.
- [F5] 🟠 프리플라이트(kis_mock_preflight --order)의 테스트 체결이 rolling_since(5) 창에
-      들어와 첫 sync에서 포지션에 반영된다 → SYNC_SINCE 하한 옵션 추가.
- [F6] 🟠 [코드로 못 막음] AUTO_MODE 가드는 이 러너의 monkeypatch다.
-      기존 vr_signal_bot.py 크론이 살아있으면 패치 안 된 apply_command가 /buy를 받는다
-      → 이중반영. 게다가 두 프로세스가 vr_position.json·offset 파일을 동시에 쓴다.
-      ★ 기존 워크플로(07:37 신호봇)를 반드시 삭제/비활성화할 것. ★
- [🟢] 체결 다수 시 TG 메시지 폭주(체결당 1건) → 429 → 알림 유실.
-      경보(🚨🔴⚠️)는 즉시, 나머지는 버퍼링 후 1건으로 flush.
-
-━━ 봉합 유지 (rev.1) ━━
- 🔴2 AUTO_MODE — apply_command '/buy'와 sync_fills가 둘 다 shares/pool/cyc_used를
-     건드린다. 자동 켠 채 /buy 보내면 같은 체결이 2번 반영.
- 🔴3 실행순서 — sync_fills를 rollover보다 먼저.
-     'rollover → sync' 순이면 사이클 마지막 세션 체결이 난 날:
-       ① 체결 반영 전 pool로 V=V+pool/G → V 왜곡
-       ② 같은 stale pool로 cyc_budget 스냅샷 + cyc_used=0 리셋
-       ③ 직후 sync가 구사이클 체결 cost를 새 cyc_used에 적재 → 새 사이클 매수한도 선소진
-     sync_fills는 fills_seen 멱등 → 먼저 1회 호출해도 daily_run 내부 2차 sync는 no-op.
-
-모의 1단계 설계(확정):
-  · use_reserve=False (정규주문). 모의는 예약주문 조회(TTTT3039R) 미지원 →
-    걸린 예약을 API로 확인 불가. 검증 단계에서 검증 불가능한 경로 금지.
-  · 크론 23:40 KST (미국 개장 직후). 정규주문은 미국장 중에만 접수.
-    신호 기준일(마지막 미국 종가=D-1)은 07:37이든 23:40이든 동일 → 단일 크론 통합.
-
-환경변수:
-  KIS_APPKEY / KIS_APPSECRET / KIS_CANO      (필수)
-  KIS_ACNT_PRDT_CD=01  KIS_MOCK=on  USE_RESERVE=off  KIS_SYMBOL=TQQQ
-  DRY_RUN=on        ← 기본 ON. 주문 안 나감. probe는 실행(가드 검증됨).
-  AUTO_MODE=off     ← ON이면 체결보고 명령 거부(자동 sync가 진실원)
-  AUTO_RECOVER=off  ← 복귀는 기본 수동(/enter)
-  STRICT_CCNL=on    ← ccnl 주문당 다행 감지 시 중단
-  SYNC_SINCE=       ← YYYY-MM-DD. 체결조회 시작일 하한(프리플라이트 체결 차단용).
-                       가동 안정 후 반드시 제거(안 그러면 창이 계속 좁혀짐).
-  + TELEGRAM_TOKEN / TELEGRAM_CHAT_ID / FRED_API_KEY / HEALTHCHECK_URL
-════════════════════════════════════════════════════════════════════════
-"""
-from __future__ import annotations
-import os, traceback
-
-import vr_signal_bot as bot                       # main()은 __main__ 가드 안이라 import 안전
-from vr_broker_adapter import LadderAutomator, daily_run, rolling_since
-from vr_kis_adapter import KISAdapter, KISError
-
-ON = bot.ON
-DRY_RUN      = ON(os.environ.get("DRY_RUN", "on"))
-AUTO_MODE    = ON(os.environ.get("AUTO_MODE", "off"))
-AUTO_RECOVER = ON(os.environ.get("AUTO_RECOVER", "off"))
-USE_RESERVE  = ON(os.environ.get("USE_RESERVE", "off"))
-KIS_MOCK     = ON(os.environ.get("KIS_MOCK", "on"))
-STRICT_CCNL  = ON(os.environ.get("STRICT_CCNL", "on"))
-SYNC_SINCE   = os.environ.get("SYNC_SINCE", "").strip()
-SYMBOL       = os.environ.get("KIS_SYMBOL", "TQQQ")
-
-# 체결을 '보고'하는 명령 = sync_fills와 진실원이 겹침 → AUTO_MODE에서 거부.
-# /setpos·/setv·/setcycle·/reset 은 의도적 '수리' 명령이라 허용(틀리면 reconcile이 잡음).
-BLOCKED_IN_AUTO = {"/buy", "/sell", "/exit", "/enter", "/deposit_done", "/lumpsum_done"}
 
 
-# ══ [🟢] 알림 버퍼 — 경보는 즉시, 나머지는 묶어서 1건 ═══════════════
-class Notifier:
-    URGENT = ("🚨", "🔴", "⚠️", "⛔")
-    def __init__(self, sink):
-        self.sink = sink; self.buf = []
-    def __call__(self, m):
-        if any(m.lstrip().startswith(u) or u in m[:4] for u in self.URGENT):
-            self.sink(m)                    # 경보는 즉시(크래시해도 남는다)
-        else:
-            self.buf.append(m)
-    def drain(self):
-        out, self.buf = self.buf, []
-        return out
+이것까지확인하고   
 
 
-# ══ [F1][F2] 스키마 가드 ═══════════════════════════════════════════
-class GuardedKIS(KISAdapter):
-    """어댑터 무수정 원칙 유지 — 필드 계약 검증만 서브클래스로 덧씌움.
-       ★ 어댑터가 실제로 .get() 하는 필드를 '전부' 검사해야 한다.
-         식별자(pdno)만 검사하면 수량 필드가 틀렸을 때 조용히 0/[]로 떨어져
-         가드가 막겠다고 선언한 무음실패가 그대로 재현된다(rev.1 실증)."""
-    _EXPECT = {
-        "balance":  ["ovrs_pdno", "ovrs_cblc_qty"],                       # pchs_avg_pric은 정보성
-        "open_ord": ["pdno", "odno", "nccs_qty"],                         # nccs_qty=0 → [] → 이중사다리
-        "fills":    ["pdno", "odno", "ft_ccld_qty", "ft_ccld_unpr3",
-                     "ord_dt"],                                           # ord_dt=dedup 키 (ODNO 일자별 채번!)
-    }
-    # sll_buy_dvsn_cd는 어댑터가 이미 fail-fast(KISError) → 중복 검사 불필요.
-
-    def _get_paged(self, path, tr_key, params, err, list_key="output", max_pages=10):
-        rows = super()._get_paged(path, tr_key, params, err, list_key, max_pages)
-        need = self._EXPECT.get(tr_key, [])
-        if rows and need:
-            miss = [k for k in need if not any(k in r for r in rows)]
-            if miss:
-                raise KISError(
-                    f"🔴 스키마 불일치[{tr_key}]: 누락 {miss}. "
-                    f"조용한 0/[] 반환 = 킬스위치 무음실패·이중사다리 경로 → 중단. "
-                    f"실제 키={list(rows[0].keys())}")
-        # ★ ccnl 행구조: sync_fills는 '(ord_dt:ODNO)당 누계 1행'을 전제한다.
-        #   체결건당 다행이면 delta<=0 → continue → 체결 유실 → shares 과소.
-        #   (ODNO는 일자별 채번이므로 반드시 ord_dt와 함께 키를 잡는다.)
-        if STRICT_CCNL and tr_key == "fills" and rows:
-            seen = {}
-            for r in rows:
-                k = f"{r.get('ord_dt','')}:{r.get('odno','')}"
-                seen[k] = seen.get(k, 0) + 1
-            dup = {k: v for k, v in seen.items() if v > 1}
-            if dup:
-                raise KISError(
-                    f"🔴 ccnl 주문당 다행 감지 {dup} — sync_fills의 delta dedup 전제 위반. "
-                    f"체결 유실 위험 → 중단. (STRICT_CCNL=off 로 무시 가능하나 비권장)")
-        return rows
+import os, getpass
+os.environ["KIS_APPKEY"]    = getpass.getpass("모의 APPKEY: ")
+os.environ["KIS_APPSECRET"] = getpass.getpass("모의 APPSECRET: ")
+os.environ["KIS_CANO"]      = input("계좌번호 앞 8자리: ").strip()
+print("입력 완료")
 
 
-# ══ [🔴2] AUTO_MODE 가드 ═══════════════════════════════════════════
-_orig_apply = bot.apply_command
+import json, requests
 
-def _guarded_apply(pos, text, price_hint, Veff_target=None):
-    t = (text or "").strip().split()
-    cmd = t[0].lower().split("@", 1)[0] if t else ""
-    if AUTO_MODE and cmd in BLOCKED_IN_AUTO:
-        return pos, (f"⛔ AUTO_MODE — <code>{cmd}</code> 거부.\n"
-                     f"   체결은 증권사 API로 자동 동기화됩니다(이중반영 방지).\n"
-                     f"   수동 개입이 필요하면 AUTO_MODE=off 후 실행.")
-    return _orig_apply(pos, text, price_hint, Veff_target)
+MOCK = "https://openapivts.koreainvestment.com:29443"
+AK   = os.environ["KIS_APPKEY"]
+SK   = os.environ["KIS_APPSECRET"]
 
-bot.apply_command = _guarded_apply
+r = requests.post(f"{MOCK}/oauth2/tokenP",
+                  headers={"content-type": "application/json"},
+                  data=json.dumps({"grant_type": "client_credentials",
+                                   "appkey": AK, "appsecret": SK}),
+                  timeout=10)
+print("HTTP", r.status_code)
+d = r.json()
 
-
-# ══ [F4] 조회 전용 프로브 — DRY에서도 반드시 실행 ═══════════════════
-def probe(broker, pos, since):
-    """dry_run이면 sync_fills/reconcile/rotate_cycle이 전부 스킵되어
-       get_holdings·list_open_orders·get_fills가 한 번도 호출되지 않는다.
-       = 스키마 가드가 발동할 기회가 없다 = DRY가 KIS를 아무것도 검증 못 한다.
-       → 주문은 내지 않고 조회 4종만 실제로 태워 가드를 발동시킨다."""
-    L = ["🔍 <b>조회 프로브</b> (주문 없음)"]
-    px = broker.get_price(SYMBOL)
-    L.append(f"   현재가 ${px:,.2f}")
-
-    held = broker.get_holdings(SYMBOL)                      # ← balance 스키마 가드
-    bs = float(pos.get("shares", 0.0))
-    ok = abs(held.shares - bs) <= 0.5
-    L.append(f"   실보유 {held.shares:g}주 vs 봇 {bs:g}주  {'✅' if ok else '🚨 불일치'}")
-
-    opens = broker.list_open_orders(SYMBOL)                 # ← nccs 스키마 가드
-    L.append(f"   미체결 {len(opens)}건" + (f" {[o['order_id'] for o in opens][:5]}" if opens else ""))
-
-    fills = broker.get_fills(SYMBOL, since)                 # ← ccnl 스키마 + 행구조 가드
-    L.append(f"   체결({since}~) {len(fills)}건")
-
-    try:
-        L.append(f"   주문가능 ${broker.get_cash_usd():,.0f} "
-                 f"(Pool ${float(pos.get('pool',0)):,.0f} · 증거금 차감분이라 참고용)")
-    except Exception as e:
-        L.append(f"   주문가능 조회 생략: {e}")
-    return "\n".join(L), ok
+if "access_token" in d:
+    TOKEN = d["access_token"]
+    os.environ["KIS_TOKEN"] = TOKEN
+    print("✅ P0 인증 성공")
+    print("   토큰 앞 20자:", TOKEN[:20], "...")
+    print("   만료(초):", d.get("expires_in"))
+else:
+    print("❌ P0 인증 실패")
+    print(json.dumps(d, ensure_ascii=False, indent=2))
 
 
-# ══ 러너 ═══════════════════════════════════════════════════════════
-def make_broker():
-    ak, sk, cano = (os.environ.get("KIS_APPKEY"), os.environ.get("KIS_APPSECRET"),
-                    os.environ.get("KIS_CANO"))
-    if not (ak and sk and cano):
-        raise SystemExit("환경변수 필요: KIS_APPKEY / KIS_APPSECRET / KIS_CANO")
-    return GuardedKIS(ak, sk, cano,
-                      acnt_prdt_cd=os.environ.get("KIS_ACNT_PRDT_CD", "01"),
-                      mock=KIS_MOCK, use_reserve=USE_RESERVE)
 
+import time
 
-def run():
-    mode = ("DRY" if DRY_RUN else "LIVE") + ("/모의" if KIS_MOCK else "/실전")
-    banner = (f"⚙️ 자동매매 {mode} · AUTO_MODE={'on' if AUTO_MODE else 'off'} · "
-              f"자동복귀={'on' if AUTO_RECOVER else 'off'} · "
-              f"예약주문={'on' if USE_RESERVE else 'off'}")
-    print(banner)
+CANO = os.environ["KIS_CANO"]
+ACNT = "01"
+SYMB = "TQQQ"
+EXCD_ORD = "NASD"   # 주문·잔고
+EXCD_PRC = "NAS"    # 시세
+S = requests.Session()
 
-    df  = bot.build_data()
-    pos = bot.load_position()
+def H(tr_id):
+    return {"content-type": "application/json",
+            "authorization": f"Bearer {os.environ['KIS_TOKEN']}",
+            "appkey": AK, "appsecret": SK,
+            "tr_id": tr_id, "custtype": "P"}
 
-    broker = make_broker()
-    notifier = Notifier(bot._tg)
-    auto = LadderAutomator(broker, SYMBOL, dry_run=DRY_RUN, notify=notifier)
+def GET(path, tr_id, params, label):
+    r = S.get(f"{MOCK}{path}", headers=H(tr_id), params=params, timeout=10)
+    d = r.json()
+    time.sleep(0.6)
+    print(f"[{label}] HTTP {r.status_code} | rt_cd={d.get('rt_cd')} "
+          f"msg_cd={d.get('msg_cd')} msg1={(d.get('msg1') or '').strip()}")
+    return d, str(d.get("rt_cd")) == "0"
 
-    # [F5] 체결조회 창 하한 — 프리플라이트 테스트 체결이 빨려들어오는 것 차단
-    since = rolling_since(5)
-    if SYNC_SINCE and SYNC_SINCE > since:
-        since = SYNC_SINCE
-        notifier(f"ℹ️ SYNC_SINCE={SYNC_SINCE} 적용 — 안정화 후 제거할 것")
-
-    # [F4] ① 프로브 — DRY 포함 항상. 스키마 가드가 여기서 발동한다.
-    probe_msg, recon_ok = probe(broker, pos, since)
-    notifier(probe_msg)
-
-    # [🔴3] ② sync_fills 먼저 (구사이클 pool 확정). DRY면 어차피 no-op → 스킵(중복 알림 방지).
-    if not DRY_RUN:
-        try:
-            pos = auto.sync_fills(pos, since)
-            bot.save_position(pos)
-        except Exception as e:
-            bot._tg(f"🚨 체결동기화 실패 — 전 단계 중단(안전): {e}")
-            raise
-
-    px_col = "TQQQ_REAL" if ("TQQQ_REAL" in df.columns and
-                             not bot.pd.isna(df["TQQQ_REAL"].iloc[-1])) else "TQQQ"
-    price_hint = float(df[px_col].iloc[-1])
-
-    # ③ ensure_V → rollover (이제 체결 반영된 pool로 V·cyc_budget 스냅샷)
-    pos = bot.ensure_V(pos, price_hint)
-    pos, roll_msg, cycle_changed = bot._cycle_rollover(pos, df)
-    if cycle_changed:
-        bot.save_position(pos)
-
-    # ④ 명령 처리 (AUTO_MODE면 체결보고 명령 거부)
-    V_tmp = pos.get("V", 0.0) or (pos.get("shares", 0.0) * price_hint)
-    if ON(bot.VOLTGT_ON) and pos.get("cyc_scale") is not None:
-        scale = float(pos["cyc_scale"])
-    else:
-        rv = float(df["RV"].iloc[-1]) if not bot.pd.isna(df["RV"].iloc[-1]) else float("nan")
-        scale = (min(1.0, bot.VOLTGT_TARGET / rv)
-                 if (ON(bot.VOLTGT_ON) and rv == rv and rv > 0) else 1.0)
-    pos, cmd_results = bot.process_commands(pos, price_hint, V_tmp * scale)
-
-    if pos.get("shares", 0) == 0 and pos.get("pool", 0) == 0 and not cmd_results:
-        bot._tg("⚠️ 포지션 미등록 — <code>/setpos</code> 먼저. 자동매매 스킵.")
+def show_keys(rows, name):
+    if not rows:
+        print(f"  ⚪ {name}: 행 0개 — 필드 확정 불가")
         return
+    print(f"  실제 키 ({len(rows[0])}개): {list(rows[0].keys())}")
+    print(f"  샘플 행: {json.dumps(rows[0], ensure_ascii=False)[:500]}")
 
-    # ⑤ daily_run — 내부 sync는 멱등 no-op. compute_ladder 필수(DAY-only 브로커).
-    pos = daily_run(auto, pos, bot.compute_signal, df, since, bot.save_position,
-                    auto_recover=AUTO_RECOVER, compute_ladder=bot.compute_ladder)
-
-    # ⑥ 리포트 (daily_run이 중간 return해도 항상 발송) + 버퍼 알림 flush
-    s = bot.compute_signal(df, pos)
-    head = [banner]
-    if cmd_results:
-        head.append("✅ <b>처리된 명령</b>")
-        head += [f"   • {r}" for r in cmd_results]
-    if roll_msg:
-        head.append(f"🔄 {roll_msg}")
-    buffered = notifier.drain()
-    if buffered:
-        head.append("")
-        head += buffered
-    report = "\n".join(head) + "\n\n" + bot.build_report(s, df)
-
-    if bot._tg(report):
-        bot._save_last(str(s["today"].date()))
-        bot._ping()
-        if s.get("is_cycle_start"):
-            pos["ladder_placed_for"] = str(s["cyc_start"]); bot.save_position(pos)
-        rcd = s.get("recover_check_date")
-        recovering = bool(s.get("ks_recover")) or (s.get("action_ks") == "🔵 복귀")
-        if rcd and not recovering and rcd != pos.get("last_recover_check", ""):
-            pos["last_recover_check"] = rcd; bot.save_position(pos)
-    else:
-        print("[경고] 텔레그램 전송 실패"); print(report)
+print("헬퍼 준비 완료")
 
 
-if __name__ == "__main__":
-    try:
-        run()
-    except Exception as e:
-        bot._emergency_tg(e)
-        print(f"[크래시] {e}"); traceback.print_exc()
-        raise
+d, ok = GET("/uapi/overseas-price/v1/quotations/price", "HHDFS00000300",
+            {"AUTH": "", "EXCD": EXCD_PRC, "SYMB": SYMB}, "P1 현재가")
+px = float((d.get("output") or {}).get("last", 0) or 0)
+print(f"  TQQQ last = ${px}")
+
+
+
+d, ok = GET("/uapi/overseas-stock/v1/trading/inquire-balance", "VTTS3012R",
+            {"CANO": CANO, "ACNT_PRDT_CD": ACNT, "OVRS_EXCG_CD": EXCD_ORD,
+             "TR_CRCY_CD": "USD", "CTX_AREA_FK200": "", "CTX_AREA_NK200": ""},
+            "P2 잔고")
+rows = d.get("output1") or []
+print(f"  보유 종목 {len(rows)}건")
+show_keys(rows, "balance.output1")
+print("\n  output2(요약):", json.dumps(d.get("output2") or {}, ensure_ascii=False)[:400])
+
+
+
+for unpr in ("0", f"{px:.2f}"):
+    d, ok = GET("/uapi/overseas-stock/v1/trading/inquire-psamount", "VTTS3007R",
+                {"CANO": CANO, "ACNT_PRDT_CD": ACNT, "OVRS_EXCG_CD": EXCD_ORD,
+                 "OVRS_ORD_UNPR": unpr, "ITEM_CD": SYMB},
+                f"P3 매수가능(unpr={unpr})")
+    if ok:
+        o = d.get("output") or {}
+        show_keys([o], "psbl.output")
+
+
+
+이것까지인증하고   
+
+
+[P2 잔고] HTTP 200 | rt_cd=0 msg_cd=70070000 msg1=모의투자 조회할 내역(자료)이 없습니다.
+  보유 종목 0건
+  ⚪ balance.output1: 행 0개 — 필드 확정 불가
+  output2(요약): {"frcr_pchs_amt1": "0.00000", "ovrs_rlzt_pfls_amt": "0.00000", "ovrs_tot_pfls": "0.00000", "rlzt_erng_rt": "0.00000000", "tot_evlu_pfls_amt": "0.00000000", "tot_pftrt": "0.00000000", "frcr_buy_amt_smtl1": "0.000000", "ovrs_rlzt_pfls_amt2": "0.00000", "frcr_buy_amt_smtl2": "0.000000"} 5번맞나?
+
+
+
+
+P3 매수가능(unpr=0)] HTTP 200 | rt_cd=0 msg_cd=20310000 msg1=모의투자 조회가 완료되었습니다.
+  실제 키 (11개): ['tr_crcy_cd', 'ord_psbl_frcr_amt', 'sll_ruse_psbl_amt', 'ovrs_ord_psbl_amt', 'max_ord_psbl_qty', 'echm_af_ord_psbl_amt', 'echm_af_ord_psbl_qty', 'ord_psbl_qty', 'exrt', 'frcr_ord_psbl_amt1', 'ovrs_max_ord_psbl_qty']
+  샘플 행: {"tr_crcy_cd": "USD", "ord_psbl_frcr_amt": "100000.00", "sll_ruse_psbl_amt": "0.00", "ovrs_ord_psbl_amt": "100000.00", "max_ord_psbl_qty": "0", "echm_af_ord_psbl_amt": "100000.00", "echm_af_ord_psbl_qty": "0", "ord_psbl_qty": "0", "exrt": "1504.2000000000", "frcr_ord_psbl_amt1": "99000.000000", "ovrs_max_ord_psbl_qty": "0"}
+[P3 매수가능(unpr=77.03)] HTTP 200 | rt_cd=0 msg_cd=20310000 msg1=모의투자 조회가 완료되었습니다.
+  실제 키 (11개): ['tr_crcy_cd', 'ord_psbl_frcr_amt', 'sll_ruse_psbl_amt', 'ovrs_ord_psbl_amt', 'max_ord_psbl_qty', 'echm_af_ord_psbl_amt', 'echm_af_ord_psbl_qty', 'ord_psbl_qty', 'exrt', 'frcr_ord_psbl_amt1', 'ovrs_max_ord_psbl_qty']
+  샘플 행: {"tr_crcy_cd": "USD", "ord_psbl_frcr_amt": "100000.00", "sll_ruse_psbl_amt": "0.00", "ovrs_ord_psbl_amt": "100000.00", "max_ord_psbl_qty": "1285", "echm_af_ord_psbl_amt": "100000.00", "echm_af_ord_psbl_qty": "1285", "ord_psbl_qty": "1285", "exrt": "1504.2000000000", "frcr_ord_psbl_amt1": "99000.000000", "ovrs_max_ord_psbl_qty": "1285"}
+
+
+이것까지하고 G1 만들던 단계다 이어서 진행해줘
