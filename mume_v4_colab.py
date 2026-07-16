@@ -302,13 +302,18 @@ def _vscale(sig, day):
     return min(1.0, VOLTGT_TARGET / float(rv))
 
 
+# [2026-07-16] 원조건(버블≥1.30) 분기를 끄는 전역 스위치 — B1 단독 효과 격리용.
+#   True면 원조건 미발동 → 대피는 B1(백분위)만 담당. 2008급을 B1이 잡는지 순수 측정.
+_ORIG_COND_OFF = False
+
 def _exit_sig(sig, dd):
     g = sig["G"].get(dd, np.nan); gs = sig["GS"].get(dd, np.nan)
     if pd.isna(g) or pd.isna(gs) or g >= gs:
         return False
-    bub = sig["BU"].get(dd, np.nan)
-    if not pd.isna(bub) and bub >= BUBBLE_LIMIT:
-        return True
+    if not _ORIG_COND_OFF:                       # 원조건(1.30) — 격리 시 건너뜀
+        bub = sig["BU"].get(dd, np.nan)
+        if not pd.isna(bub) and bub >= BUBBLE_LIMIT:
+            return True
     if ON(B1_ON):
         pc = sig["PCTL"].get(dd, np.nan)
         if not pd.isna(pc) and pc >= B1_PCTL:
@@ -904,65 +909,92 @@ def m0_source_sensitivity(df_fred, df_fb, init=None):
 # ══════════════ [7. 실행] ══════════════
 
 # ══════════════════════════════════════════════════════════════════════
-#  [B1 롤링 검증 — 1986~ 전 구간]  ★배수 대신 CAGR·MDD·Calmar만 (방법 B)
+#  [B1 롤링 검증 — 1986~]  방법 B(CAGR·MDD·Calmar) · arm 3개(원조건/B1 분리)
 # ══════════════════════════════════════════════════════════════════════
-#  왜 배수를 안 보나: 3배로 닷컴(1990~2000)을 타면 배수가 수천 배로 튀고 붕괴 후
-#    추락 — 극단적 경로 의존. CAGR·MDD·Calmar는 그 왜곡이 훨씬 작다(특히 방어율).
-#  합성 구간 주의: TQQQ는 합성이라 절대성과는 참고용. 그러나 B1 신호(GSPC/M0)는
-#    1986년부터 진짜 데이터 → 방어율은 신뢰 가능(진단 G에서 신호 정확성 확인).
+#  ★arm 3개 (Gemini 검증 4 반영 — 원조건과 B1 기여 분리)
+#     off   : 대피 안 함 (기준선)
+#     B1only: 백분위≥0.75만, 원조건(1.30) 끔 → B1 순수 효과
+#     full  : 원조건+B1 (합산)
+#   핵심 비교 = B1only vs off = B1 단독 방어. 2008(B1 미발동)이 여기 어떻게 나오나.
+#
+#  ★방어율 해석 (Gemini 검증 3 반영)
+#     dMDD 부호(줄었나/늘었나)는 신뢰 — 신호 시점이 실데이터(GSPC/M0)라서.
+#     dMDD 크기(+25%p 등)는 합성 구간에선 참고 — 두 MDD 다 합성 가격 기반.
+#     → 합성 구간에선 '방어 여부(부호)'만, 실측 구간에선 '크기'까지 본다.
 # ══════════════════════════════════════════════════════════════════════
-def _metrics(sub, killswitch):
-    r = run_vr(sub, HOLD_CAP, HOLD_POOL, HOLD_G, HOLD_LIMIT, killswitch=killswitch)
-    return r["cagr"], r["mdd"], r["sharpe"]
+def _run_arm(sub, arm):
+    """arm: 'off'|'B1only'|'full'. run_vr를 해당 설정으로 돌려 CAGR·MDD 반환."""
+    global _ORIG_COND_OFF, B1_ON
+    sv_o, sv_b = _ORIG_COND_OFF, B1_ON
+    if arm == "off":
+        ks = False
+    elif arm == "B1only":
+        ks = True; _ORIG_COND_OFF = True;  B1_ON = "on"
+    else:  # full
+        ks = True; _ORIG_COND_OFF = False; B1_ON = "on"
+    r = run_vr(sub, HOLD_CAP, HOLD_POOL, HOLD_G, HOLD_LIMIT, killswitch=ks)
+    _ORIG_COND_OFF, B1_ON = sv_o, sv_b
+    return r["cagr"], r["mdd"]
 
-def b1_rolling_full(df, hold_years=10, step_months=3):
-    global KILLSWITCH
-    sv = KILLSWITCH
-    last_start = df.index[-1] - pd.DateOffset(years=hold_years)
-    starts = pd.date_range(df.index[0], last_start, freq=f"{step_months}MS")
+def b1_rolling_arms(df, hold_years=10, step_months=3):
+    last = df.index[-1] - pd.DateOffset(years=hold_years)
+    starts = pd.date_range(df.index[0], last, freq=f"{step_months}MS")
     min_len = int(252 * hold_years * 0.9)
     rows = []
     for sd in starts:
         sub = df[(df.index >= sd) & (df.index <= sd + pd.DateOffset(years=hold_years))]
-        if len(sub) < min_len:
-            continue
-        KILLSWITCH = "on";  c1, m1, s1 = _metrics(sub, True)
-        KILLSWITCH = "off"; c0, m0_, s0 = _metrics(sub, False)
-        if not (np.isfinite(c1) and np.isfinite(c0) and m1 < 0 and m0_ < 0):
-            continue
+        if len(sub) < min_len: continue
+        c_off, m_off = _run_arm(sub, "off")
+        c_b1,  m_b1  = _run_arm(sub, "B1only")
+        c_fl,  m_fl  = _run_arm(sub, "full")
+        if not all(np.isfinite(x) for x in [c_off,c_b1,c_fl]): continue
+        if not (m_off<0 and m_b1<0 and m_fl<0): continue
         era = "실측" if sd >= pd.Timestamp("2010-02-11") else "합성"
-        rows.append(dict(start=sd, era=era, dcagr=(c1-c0)*100,
-                         mdd_on=m1*100, mdd_off=m0_*100, dmdd=(m1-m0_)*100,
-                         dcal_pct=((c1/abs(m1))/(c0/abs(m0_))-1)*100))
-    KILLSWITCH = sv
+        rows.append(dict(start=sd, era=era,
+            mdd_off=m_off*100, mdd_b1=m_b1*100, mdd_full=m_fl*100,
+            # B1 단독 방어 (vs off)
+            dmdd_b1=(m_b1-m_off)*100, dcagr_b1=(c_b1-c_off)*100,
+            dcal_b1=((c_b1/abs(m_b1))/(c_off/abs(m_off))-1)*100,
+            # full 방어 (vs off) — 원조건 포함
+            dmdd_full=(m_fl-m_off)*100,
+            # 원조건 순증분 (full − B1only) — 2008급에서 원조건이 추가로 잡은 몫
+            dmdd_orig=(m_fl-m_b1)*100))
     R = pd.DataFrame(rows)
 
     def rep(sub, title):
         if len(sub)==0: print(f"\n  {title}: 표본 없음"); return
-        n=len(sub); mw=(sub.dmdd>0).sum(); cw=(sub.dcal_pct>0).sum(); gw=(sub.dcagr>0).sum()
+        n=len(sub)
+        b1w=(sub.dmdd_b1>0).sum(); flw=(sub.dmdd_full>0).sum()
+        ow =(sub.dmdd_orig>0).sum()   # 원조건이 B1 위에 추가 방어한 창 수
         print(f"\n  ── {title} (표본 {n}) ──")
-        print(f"     낙폭 방어(dMDD>0): {mw}/{n} ({mw/n*100:.0f}%) · 중앙 dMDD {sub.dmdd.median():+.1f}%p")
-        print(f"     Calmar 개선     : {cw}/{n} ({cw/n*100:.0f}%) · 중앙 {sub.dcal_pct.median():+.1f}%")
-        print(f"     수익 개선       : {gw}/{n} ({gw/n*100:.0f}%) · 중앙 dCAGR {sub.dcagr.median():+.2f}%p")
-        print(f"     MDD: off 중앙 {sub.mdd_off.median():.1f}% → on 중앙 {sub.mdd_on.median():.1f}%")
+        print(f"     [B1 단독]  낙폭방어 {b1w}/{n} ({b1w/n*100:.0f}%) · 중앙 dMDD {sub.dmdd_b1.median():+.1f}%p"
+              f" · 중앙 dCAGR {sub.dcagr_b1.median():+.2f}%p")
+        print(f"     [원조건+B1] 낙폭방어 {flw}/{n} ({flw/n*100:.0f}%) · 중앙 dMDD {sub.dmdd_full.median():+.1f}%p")
+        print(f"     [원조건 순증분] full이 B1only보다 더 방어한 창: {ow}/{n} ({ow/n*100:.0f}%)"
+              f" · 중앙 {sub.dmdd_orig.median():+.1f}%p")
+        print(f"     MDD 중앙: off {sub.mdd_off.median():.1f}% → B1만 {sub.mdd_b1.median():.1f}%"
+              f" → 원조건+B1 {sub.mdd_full.median():.1f}%")
 
-    print("\n"+"="*80)
-    print(f"  [B1 롤링] {hold_years}년 보유·{step_months}개월 간격·방법 B | {df.index[0].date()}~{df.index[-1].date()}")
-    print("="*80)
-    rep(R, "전체(합성+실측)")
-    rep(R[R.era=="합성"], "합성 구간(2010 이전 — 신호 정확, 성과 참고)")
-    rep(R[R.era=="실측"], "실측 구간(2010~ — 성과도 신뢰)")
-    print("\n"+"="*80)
-    print("  판독: 낙폭 방어%가 합성·실측 양쪽 90%+ → B1은 견고한 보험.")
-    print("        합성·실측 방어%가 비슷 → 2010 이전을 버릴 이유 없었다는 증거.")
-    print("="*80)
+    print("\n"+"="*82)
+    print(f"  [B1 롤링·arm3] {hold_years}년·{step_months}개월 | {df.index[0].date()}~{df.index[-1].date()}")
+    print(f"  ★합성 구간: 방어 '부호'만 신뢰(신호=실데이터). 크기는 참고(성과=합성).")
+    print("="*82)
+    rep(R, "전체")
+    rep(R[R.era=="합성"], "합성 구간(2010 이전)")
+    rep(R[R.era=="실측"], "실측 구간(2010~)")
+    print("\n"+"="*82)
+    print("  판독:")
+    print("   · [B1 단독] 방어%가 합성·실측 비슷하게 높으면 → B1은 견고한 보험. 2010 이전 버릴 이유 없었음.")
+    print("   · [원조건 순증분]이 합성 구간에서 크면 → 2008급을 원조건이 잡았다는 증거(B1 사각지대).")
+    print("   · [B1 단독]이 실측보다 합성에서 낮으면 → 합성 위기(2008 등)를 B1이 못 잡은 것.")
+    print("="*82)
     return R
 
 if __name__ == "__main__":
     db = _drive_base()
-    print("="*80); print("  라오어 VR — B1 롤링 검증 (1986~, NEW 합성)"); print("="*80)
+    print("="*82); print("  라오어 VR — B1 롤링 (1986~, NEW 합성, arm 3개)"); print("="*82)
     df = build_data(db)
     print(f"  · {df.index[0].date()}~{df.index[-1].date()} ({len(df)}행) | 버블 {df['BUB'].iloc[-1]:.2f}")
-    print(f"  · B1={B1_ON}({B1_PCTL}) · VOLTGT={VOLTGT_ON}")
-    b1_rolling_full(df, hold_years=10, step_months=3)
-    b1_rolling_full(df, hold_years=5,  step_months=2)
+    print(f"  · B1_PCTL={B1_PCTL} · VOLTGT={VOLTGT_ON}")
+    b1_rolling_arms(df, hold_years=10, step_months=3)
+    b1_rolling_arms(df, hold_years=5,  step_months=2)
