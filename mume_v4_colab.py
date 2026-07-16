@@ -177,9 +177,14 @@ def build_data(db=""):
         return out
 
     qqq = splice((1 + ndx.pct_change().fillna(0).clip(-.5, .5)).cumprod() * 100, qqq_real, "QQQ")
-    drag = (irx / 100) * TQQQ_DRAG_MULT + TQQQ_DRAG_ADD
-    tqqq = splice((1 + (qqq.pct_change().fillna(0).clip(-.5, .5) * 3 - drag / 252)).cumprod() * 100,
-                  tqqq_real, "TQQQ")
+    # ★2026-07-16 합성 교정(NEW): 기존 clip(-.5,.5)*3은 폭락일 -150% → 자산 음수 폭발
+    #   (배수오차 -41.7%). 교정 후 실측 대비 -2.0%, 상관 0.9986. 레버리지 ETF 표준:
+    #   NDX*3, 원지수 -33.3% 이하는 -99% 고정(전액소멸), 비용=금리+보수0.84%.
+    r_ndx = qqq.pct_change().fillna(0)
+    daily_lev = np.where(r_ndx <= -0.3333, -0.99, r_ndx * 3)
+    daily_cost = (irx / 100 + 0.0084) / 252
+    tqqq_syn = (1 + (pd.Series(daily_lev, index=qqq.index) - daily_cost)).cumprod() * 100
+    tqqq = splice(tqqq_syn, tqqq_real, "TQQQ")
 
     out = pd.DataFrame({"TQQQ": tqqq, "QQQ": qqq, "GSPC": gspc, "NDX": ndx, "IRX": irx,
                         "GSMA": gspc.rolling(200).mean(), "NSMA": ndx.rolling(200).mean(),
@@ -897,57 +902,67 @@ def m0_source_sensitivity(df_fred, df_fb, init=None):
 
 
 # ══════════════ [7. 실행] ══════════════
+
+# ══════════════════════════════════════════════════════════════════════
+#  [B1 롤링 검증 — 1986~ 전 구간]  ★배수 대신 CAGR·MDD·Calmar만 (방법 B)
+# ══════════════════════════════════════════════════════════════════════
+#  왜 배수를 안 보나: 3배로 닷컴(1990~2000)을 타면 배수가 수천 배로 튀고 붕괴 후
+#    추락 — 극단적 경로 의존. CAGR·MDD·Calmar는 그 왜곡이 훨씬 작다(특히 방어율).
+#  합성 구간 주의: TQQQ는 합성이라 절대성과는 참고용. 그러나 B1 신호(GSPC/M0)는
+#    1986년부터 진짜 데이터 → 방어율은 신뢰 가능(진단 G에서 신호 정확성 확인).
+# ══════════════════════════════════════════════════════════════════════
+def _metrics(sub, killswitch):
+    r = run_vr(sub, HOLD_CAP, HOLD_POOL, HOLD_G, HOLD_LIMIT, killswitch=killswitch)
+    return r["cagr"], r["mdd"], r["sharpe"]
+
+def b1_rolling_full(df, hold_years=10, step_months=3):
+    global KILLSWITCH
+    sv = KILLSWITCH
+    last_start = df.index[-1] - pd.DateOffset(years=hold_years)
+    starts = pd.date_range(df.index[0], last_start, freq=f"{step_months}MS")
+    min_len = int(252 * hold_years * 0.9)
+    rows = []
+    for sd in starts:
+        sub = df[(df.index >= sd) & (df.index <= sd + pd.DateOffset(years=hold_years))]
+        if len(sub) < min_len:
+            continue
+        KILLSWITCH = "on";  c1, m1, s1 = _metrics(sub, True)
+        KILLSWITCH = "off"; c0, m0_, s0 = _metrics(sub, False)
+        if not (np.isfinite(c1) and np.isfinite(c0) and m1 < 0 and m0_ < 0):
+            continue
+        era = "실측" if sd >= pd.Timestamp("2010-02-11") else "합성"
+        rows.append(dict(start=sd, era=era, dcagr=(c1-c0)*100,
+                         mdd_on=m1*100, mdd_off=m0_*100, dmdd=(m1-m0_)*100,
+                         dcal_pct=((c1/abs(m1))/(c0/abs(m0_))-1)*100))
+    KILLSWITCH = sv
+    R = pd.DataFrame(rows)
+
+    def rep(sub, title):
+        if len(sub)==0: print(f"\n  {title}: 표본 없음"); return
+        n=len(sub); mw=(sub.dmdd>0).sum(); cw=(sub.dcal_pct>0).sum(); gw=(sub.dcagr>0).sum()
+        print(f"\n  ── {title} (표본 {n}) ──")
+        print(f"     낙폭 방어(dMDD>0): {mw}/{n} ({mw/n*100:.0f}%) · 중앙 dMDD {sub.dmdd.median():+.1f}%p")
+        print(f"     Calmar 개선     : {cw}/{n} ({cw/n*100:.0f}%) · 중앙 {sub.dcal_pct.median():+.1f}%")
+        print(f"     수익 개선       : {gw}/{n} ({gw/n*100:.0f}%) · 중앙 dCAGR {sub.dcagr.median():+.2f}%p")
+        print(f"     MDD: off 중앙 {sub.mdd_off.median():.1f}% → on 중앙 {sub.mdd_on.median():.1f}%")
+
+    print("\n"+"="*80)
+    print(f"  [B1 롤링] {hold_years}년 보유·{step_months}개월 간격·방법 B | {df.index[0].date()}~{df.index[-1].date()}")
+    print("="*80)
+    rep(R, "전체(합성+실측)")
+    rep(R[R.era=="합성"], "합성 구간(2010 이전 — 신호 정확, 성과 참고)")
+    rep(R[R.era=="실측"], "실측 구간(2010~ — 성과도 신뢰)")
+    print("\n"+"="*80)
+    print("  판독: 낙폭 방어%가 합성·실측 양쪽 90%+ → B1은 견고한 보험.")
+    print("        합성·실측 방어%가 비슷 → 2010 이전을 버릴 이유 없었다는 증거.")
+    print("="*80)
+    return R
+
 if __name__ == "__main__":
     db = _drive_base()
-    print("=" * 122)
-    print("  라오어 VR v2 — 거치식·적립식·인출식 (+킬스위치/B1/VOLTGT) · 신호·집행 분리")
-    print("=" * 122)
+    print("="*80); print("  라오어 VR — B1 롤링 검증 (1986~, NEW 합성)"); print("="*80)
     df = build_data(db)
-    df_fb = build_data_fallback(db)
-    print(f"  · 시계열: {df.index[0].date()} ~ {df.index[-1].date()} ({len(df)}행) "
-          f"| 버블 최신 {df['BUB'].iloc[-1]:.2f}")
-    print(f"  · SIGNAL_LAG={SIGNAL_LAG} "
-          f"({'봇 정합 — 전일 종가 신호 → 당일 종가 집행' if SIGNAL_LAG else 'v1 재현 — 당일 신호·당일 집행'})")
-
-    # summary(df)
-
-    if ON(RUN_HOLD):
-        _table(df, f"거치식VR {HOLD_CAP:,.0f} (Pool{HOLD_POOL*100:.0f}%, G={HOLD_G}, "
-                   f"한도{HOLD_LIMIT*100:.0f}%, 세후)",
-               HOLD_CAP, HOLD_POOL, HOLD_G, HOLD_LIMIT, 0.0, 0.0)
-    if ON(RUN_DCA):
-        _table(df, f"적립식VR (초기{DCA_INIT:.0f}, 격주적립{DCA_MONTHLY/2:.0f}, "
-                   f"Pool{DCA_POOL*100:.0f}%, G={DCA_G}, 한도{DCA_LIMIT*100:.0f}%, 세후)",
-               DCA_INIT, DCA_POOL, DCA_G, DCA_LIMIT, DCA_MONTHLY / 2, 0.0)
-    if ON(RUN_WD):
-        _table(df, f"인출식VR {WD_CAP:,.0f} (격주인출{WD_MONTHLY/2:.0f}, Pool{WD_POOL*100:.0f}%, "
-                   f"G={WD_G}, 한도{WD_LIMIT*100:.0f}%, 세후·성과=NAV+인출누계)",
-               WD_CAP, WD_POOL, WD_G, WD_LIMIT, 0.0, WD_MONTHLY / 2)
-
-    print("\n" + "=" * 122)
-    print("  · VR단독 = 킬스위치 OFF. 대피 0회면 VR+KS = VR단독. CAGR = VR+KS 세후.")
-    print("  · V_next = V + pool/G + (적립−인출). 거치 G10/P10%/한도50 · 적립 G10/P0%/한도75 "
-          "· 인출 G20/P20%/한도25")
-    print("  · ★신호·집행 분리: 대피·복귀·VOLTGT는 전일 종가 신호로 당일 종가에 집행(봇=익일 LOC).")
-    print("    밴드 매매(사다리)는 지정가 사전게시 → 당일 체결이 정당(지연 없음).")
-    print("=" * 122)
-
-    try:
-        pass
-        # lag_diagnostic(df)
-    except Exception as e:
-        print(f"  · LAG 진단 생략({str(e)[:60]})")
-
-    # voltgt_lag_2x2(df)
-    # combo_table_v2(df)
-
-    b1_threshold_autopsy(df)     # ★ B-0
-    b1_signal_trace(df)          # ★ B-0b
-
-    m0_source_sensitivity(df, df_fb) # ★ E-1
-
-    if ON(CHART_ON):
-        try:
-            make_chart(df, CHART_START, mode=CHART_MODE)
-        except Exception as e:
-            print(f"  · 차트 생략({str(e)[:70]})")
+    print(f"  · {df.index[0].date()}~{df.index[-1].date()} ({len(df)}행) | 버블 {df['BUB'].iloc[-1]:.2f}")
+    print(f"  · B1={B1_ON}({B1_PCTL}) · VOLTGT={VOLTGT_ON}")
+    b1_rolling_full(df, hold_years=10, step_months=3)
+    b1_rolling_full(df, hold_years=5,  step_months=2)
