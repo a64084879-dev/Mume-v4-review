@@ -1,12 +1,40 @@
+# -*- coding: utf-8 -*-
+"""
+[Phase 0 단일 실행 파일]  두 백테스터(FAST·VR)를 통째로 임베드해 블렌드 프론티어를 산출.
+이 파일 하나만 실행하면 됩니다. 다른 파일 불필요.
+  · FAST 엔진 = 부스터B A(gold), 세후
+  · VR 엔진   = 거치식 VR+KS(killswitch=on·B1=on·VOLTGT=off), 세후(FAST와 동일 잠재세 기준)
+  · 두 엔진은 격리 네임스페이스(FAST_NS/VR_NS)에서 exec → 상수 충돌(END_DATE 등) 없음.
+"""
+import os, sys
+
+# ============================================================================
+#  [임베드 1/2] FAST 엔진 (fast_backtest_fixed.py, __main__ 제외 · verbatim)
+# ============================================================================
+_FAST_ENGINE_SRC = r'''
 # ------------------------------------------------------------
-# [빠른복귀(FAST) + 스마트 BOXX 진입 백테스트] - 버그 수정 완료
-#  + QLD(나스닥100 2배) 벤치마크 비교 라인 추가 (SPY/QQQ와 동일 방식)
+# [빠른복귀(FAST) + 스마트 BOXX 진입 백테스트] — 감사 수정 반영판
+#  + QLD(나스닥100 2배) 벤치마크 비교 라인 (SPY/QQQ와 동일 방식)
 #
 #  ★ [핵심 로직: 스마트 BOXX 진입 & 최소 스왑]
-#      1. 대피 신호 발생 시: TQQQ만 매도하고 순수 달러(USD) 현금으로 대기. (비용 0%)
-#      2. 첫 번째 월말 복귀 판정일:
-#         - 복귀 조건 충족(휩소): 현금으로 바로 TQQQ 재매수. (BOXX 왕복 수수료 방어!)
-#         - 복귀 조건 미충족(진짜 하락장): 대기하던 현금만 BOXX로 매수. (금은 절대 건드리지 않음)
+#      1. 대피 신호: TQQQ만 매도 → 순수 달러(USD) 현금 대기. (비용 0%)
+#      2. 첫 월말 복귀 판정일:
+#         - recover_spx_only(버블≥1.30, S&P만 회복): 현금으로 바로 TQQQ 재매수. gold 무접촉.
+#         - fast_recover(버블<1.30, S&P/NDX 회복): 아래 FAST_RECOVER_KEEPS_GOLD 플래그에 따름.
+#              · False(기본, 기존 백테스트 유지) → 전체 50:50 재조정(_rebalance, gold도 리밸런싱).
+#              · True(헤더 원안)                → 현금으로 TQQQ만 매수, gold 무접촉.
+#         - 복귀 미충족(진짜 하락장): 대기 현금만 BOXX로 매수. (금은 절대 건드리지 않음)
+#
+#  ── 감사 수정 요약 ──
+#   F1: [5a] B(BOXX)에 boost_until_annual 돌릴 때 기본 RECOVER_BOOST(gold 40%)가 들어가
+#       B가 gold를 매수하던 버그 → 포트 정합 부스터(B는 BOXX)로 recover_boost 전달.
+#   F2: 대피 신호가 12/31에 뜨는 엣지에서 CASH_USD 연례분기가 BOXX 헤지까지 전량 매도해
+#       100% TQQQ로 튀던 버그 → aw['BOXX']=0 제거(헤지 유지).
+#   F3: 헤더 주석("복귀=현금→TQQQ만, gold 무접촉") vs 코드(_rebalance→gold 접촉) 불일치.
+#       → FAST_RECOVER_KEEPS_GOLD 플래그로 명시화(기본=기존 동작). 실거래 봇 스펙에 맞춰 선택.
+#   F4: 5월 세금 납부 시 현금 부족분 미납액이 소멸돼 NAV 과대 → 잔액 보존(최종청산 정산).
+#   F5: 부스터 로그 라벨/카운트 하드코딩('60:40') → RECOVER_BOOST에서 동적 생성.
+#   F6: get_data 3회 중복 다운로드 → FULL 1회만 받아 전 구간 공유(레이트리밋/불일치 방지).
 # ------------------------------------------------------------
 get_ipython = globals().get('get_ipython', None)
 try:
@@ -23,8 +51,11 @@ import matplotlib.pyplot as plt
 import platform, warnings, os, urllib.request
 import matplotlib.font_manager as fm
 import requests
-from google.colab import drive
-drive.mount('/content/drive')
+try:
+    from google.colab import drive as _colab_drive
+    _colab_drive.mount('/content/drive')
+except Exception:
+    pass
 warnings.filterwarnings('ignore')
 
 # 한글 폰트
@@ -48,6 +79,11 @@ plt.rcParams['axes.unicode_minus'] = False
 FETCH_START_DATE = "1985-10-01"
 START_DATE = "1986-08-01"   # ← 자유 조절(1986-08-01부터 가능)
 END_DATE = "2026-01-01"
+
+# ★ 메인 A vs B 성과표를 여러 시작일 각각으로 돌려 비교 (전체기간 표 아래에 추가 출력).
+#   빈 리스트 []면 이 비교표 생략(전체기간만).
+START_DATES = ["2010-02-11", "2013-01-02", "2016-01-02", "2018-01-02",
+               "2020-01-02", "2021-01-02", "2022-01-02", "2024-01-02"]
 
 INITIAL_CAPITAL = 100_000.0
 
@@ -79,29 +115,20 @@ MANUAL_M0_DATE = None      # 예: "2026-05-01"  (None이면 자동)
 MANUAL_M0_VALUE = None     # 예: 5400          (None이면 자동, 단위 B)
 
 # [옵션3] m0_full.csv 자동 빌드 기준: 파일의 최신월이 이 일수보다 오래되면 빌더 재실행.
-# (M0는 월간 데이터라 보통 1개월 지연 → 75일이면 갓 만든 파일은 갱신 안 하고, 진짜 낡은 것만 갱신)
 M0_STALE_DAYS = 75
-
-# ============================================================
-# [복귀규칙 비교] (선택, 백테스트 비교용 — 실전 봇과 무관)
-#   split_recover 방식: '대피 시점의 버블'에 따라 복귀 방식을 분기한다.
-# ============================================================
-# [복귀규칙: split (신중복귀)] — 보험용 보관 (상시 채택 아님)
-#   목적: 닷컴급 초거품(버블 2.0+)에서 대피했을 때, 어설픈 반등에 복귀하지 않고
-#         거품이 빠질 때까지 기다렸다 복귀. 2000 닷컴 구간에서 −39%를 +8%로 방어.
-#   [중요] 다중윈도우상 닷컴 안 오는 시작점(1986/1995)에선 −2.5~3.3%p (시작점 편향).
-#          → 상시 켜면 손해. '버블 2.0+ 초거품이 실제로 오면' 그때 고려하는 카드로만 보관.
-#   동작: 대피 시점 버블 ≥ 임계 → 신중복귀(고버블 대피) / < 임계 → 빠른복귀.
-#         신중복귀 출구(B-2, 새 숫자 없음): 버블<1.30 또는 '버블이 대피 때보다 낮아짐+S&P회복'.
-# ============================================================
-BUBBLE_FAST_THRESHOLD = 2.0                 # split 기본 임계값 (닷컴급 2.0 권장)
-SPLIT_THRESHOLDS = [1.5, 2.0, 2.5, 99.0]    # 비교 스윕 (99=사실상 '항상 신중')
 
 
 # ★ 복귀 부스터: 빠른복귀(버블<1.30, NDX/S&P 중 먼저 200일선 회복) 진입 순간의 비중.
-#   평상시 W_A와 별개로 자유 조절. 재원은 금에서 뺌(TQQQ↑, gold↓).
-#   환원: method A=S&P 200일선 확정 시 / method B=연례 리밸런싱 시 → 평상시 W_A로 복귀.
+#   평상시 W_A와 별개로 자유 조절. 재원은 헤지자산에서 뺌(TQQQ↑, 헤지↓).
+#   NOTE(F1): B(BOXX) 포트에 이 부스터를 쓸 때는 gold 키가 들어가면 안 됨.
+#            → 5a/호출부에서 포트에 맞춰 hedge 키를 자동 치환해 전달한다.
 RECOVER_BOOST = {'TQQQ': 0.60, 'gold': 0.40}
+
+# ★ F3: 빠른복귀(fast_recover_*, 버블<1.30) 시 현금 재투자 방식 선택.
+#   False = 현재 코드 동작(_rebalance(base_w) → gold까지 50:50 재조정). ★기존 백테스트 결과 유지
+#   True  = 헤더 원안(현금으로 TQQQ만 매수 / BOXX만 TQQQ 전환, gold 무접촉).
+#           실거래 봇이 '현금→TQQQ만' 방식이면 True로 맞춰 백테스트↔실거래 정합을 확보.
+FAST_RECOVER_KEEPS_GOLD = False
 
 # ============================================================
 # [2. 데이터 함수]
@@ -135,6 +162,7 @@ def _build_m0_fallback(index):
     s.index = pd.to_datetime([f"{y}-01-01" for y in s.index])
     s = s.reindex(pd.date_range("1985-01-01", "2026-12-31", freq='YS')).interpolate().ffill().bfill()
     return s.resample('D').interpolate().reindex(index).ffill().bfill()
+
 def load_m0_full(path="m0_full.csv"):
     """검증된 완전판 M0. CSV 있으면 로드, 없으면 직접 받아 검증·저장(보간 폴백 영구 제거)."""
     import io
@@ -206,8 +234,7 @@ def load_m0_full(path="m0_full.csv"):
 
 def build_m0_full(path, end=None):
     """[임베드 빌더 — 옵션3] BOGMBASE를 여러 소스로 받아 '4중 검증'(2008/2014/2021/2025)
-       통과분만 path에 저장. 성공 시 시리즈 반환, 전 소스 실패 시 None(기존 파일 안 건드림).
-       → get_data가 '파일 없음/검증실패/오래됨'일 때 자동 호출한다."""
+       통과분만 path에 저장. 성공 시 시리즈 반환, 전 소스 실패 시 None(기존 파일 안 건드림)."""
     import io
     SERIES = "BOGMBASE"
     COSD = "1985-01-01"
@@ -282,6 +309,7 @@ def build_m0_full(path, end=None):
             return s
     print("  · [경고] M0 빌더: 모든 소스 4중검증 실패 → 기존 파일 유지(있으면)")
     return None
+
 def fetch_yf(ticker, start=FETCH_START_DATE, end=END_DATE):
     try:
         df = yf.download(ticker, start=start, end=end, progress=False, auto_adjust=True)
@@ -436,7 +464,7 @@ def get_data(slice_start=None):
     close_usd['BOXX'] = boxx_px
     open_usd['BOXX'] = boxx_px
 
-    # 실제 BOXX 스플라이스 (상장일 2022-12-28 이후는 실데이터 사용, 그 전은 IRX 합성 유지)
+    # 실제 BOXX 스플라이스 (상장일 2022-12-28 이후는 실데이터, 그 전은 IRX 합성 유지)
     boxx_real_close, boxx_real_open = (fetch_yf('BOXX', start=BOXX_REAL_START)
                                        if pd.to_datetime(END_DATE) > pd.to_datetime(BOXX_REAL_START) else (None, None))
     splice('BOXX', boxx_real_close, boxx_real_open, BOXX_REAL_START)
@@ -571,7 +599,6 @@ def _calc_tax(hold, eq_p, row):
     return max(0, eq_p + latent_eq - TAX_EXEMPTION) * TAX_RATE_EQUITY
 
 def run_simulation(df_usd, initial_cap, target_w, port_name="", method='fast_recover',
-                   bubble_fast_threshold=BUBBLE_FAST_THRESHOLD,
                    recover_boost=None):
     dates = df_usd.index
     cash = float(initial_cap)
@@ -587,7 +614,6 @@ def run_simulation(df_usd, initial_cap, target_w, port_name="", method='fast_rec
     base_w = target_w.copy()
     logs = []
     trig = {}
-    exit_bubble = None   # split: 대피 시점의 버블(복귀 방식 분기용)
     pending_aw = None    # 부스터B: 예약된 복귀 부스터 목표 비중
     is_boosted = False   # boost_until_annual: 복귀 부스터 비중(60:40 등) 적용 중 여부
     _boost_w = (recover_boost if recover_boost is not None else RECOVER_BOOST)
@@ -686,15 +712,21 @@ def run_simulation(df_usd, initial_cap, target_w, port_name="", method='fast_rec
                                 if _is_taxable_equity(t): eq_p += pr
                                 cash += u * net
                                 hold[t]['units'] = max(0, hold[t]['units'] - u)
-                cash -= min(tax_bill, cash)
-                tax_bill = 0
+                # F4: 현금 부족 시 미납 잔액을 소멸시키지 않고 보존(최종청산에서 정산) → NAV 과대 방지
+                paid = min(tax_bill, cash)
+                cash -= paid
+                tax_bill -= paid
                 executed = True
 
         if pending and not executed and not is_last:
             if pending == 'go_cash': astr = '대피(USD대기)'
             elif pending == 'go_boxx': astr = '대피(BOXX전환)'
             elif pending.startswith('go_invest'):
-                astr = '복귀(부스터60:40)' if (is_boosted and pending_aw is not None) else '복귀'
+                if is_boosted and pending_aw is not None:      # F5: 라벨을 부스터 비중에서 동적 생성
+                    _bt = int(round(_boost_w.get('TQQQ', 0) * 100))
+                    astr = f'복귀(부스터{_bt}:{100 - _bt})'
+                else:
+                    astr = '복귀'
             else: astr = pending
 
             logs.append({'실행일': cd.strftime('%Y-%m-%d'), '액션': astr, '종류': trig.get('note', ''),
@@ -704,23 +736,30 @@ def run_simulation(df_usd, initial_cap, target_w, port_name="", method='fast_rec
                 _sell_all('TQQQ', p)
                 state = 'CASH_USD'
             elif pending == 'go_boxx':
-                _buy_amt('BOXX', cash, p) # 🟢 버그 수정: 금을 건드리지 않고 달러(cash)만 BOXX로 전액 매수
+                _buy_amt('BOXX', cash, p)  # 금 무접촉: 대기 달러(cash)만 BOXX로 전액 매수
                 state = 'CASH_BOXX'
             elif pending == 'go_invest_from_usd':
                 note = trig.get('note', '')
-                if pending_aw is not None:                     # 부스터B: NDX 단독복귀 시 부스터 비중(60:40)으로 재진입
+                if pending_aw is not None:                     # 부스터B: NDX 단독복귀 시 부스터 비중으로 재진입
                     _rebalance(pending_aw, p); pending_aw = None
                 elif note.startswith('fast_recover'):
-                    _rebalance(base_w, p)
+                    if FAST_RECOVER_KEEPS_GOLD:
+                        _buy_amt('TQQQ', cash, p)               # F3-True: 현금→TQQQ만, gold 무접촉
+                    else:
+                        _rebalance(base_w, p)                   # F3-False(기본): 전체 50:50 재조정
                 else:
-                    _buy_amt('TQQQ', cash, p)
+                    _buy_amt('TQQQ', cash, p)                   # recover_spx_only: 현금→TQQQ만
                 state = 'INVESTED'
             elif pending == 'go_invest_from_boxx':
                 note = trig.get('note', '')
-                if pending_aw is not None:                     # 부스터B: NDX 단독복귀 시 부스터 비중(60:40)으로 재진입
+                if pending_aw is not None:                     # 부스터B: NDX 단독복귀 시 부스터 비중으로 재진입
                     _rebalance(pending_aw, p); pending_aw = None
                 elif note.startswith('fast_recover'):
-                    _rebalance(base_w, p)
+                    if FAST_RECOVER_KEEPS_GOLD:
+                        proc = _sell_all('BOXX', p)             # F3-True: 대기 BOXX만 TQQQ로, gold 무접촉
+                        _buy_amt('TQQQ', proc, p)
+                    else:
+                        _rebalance(base_w, p)                   # F3-False(기본): 전체 50:50 재조정
                 else:
                     hedge_assets = [k for k in base_w if k not in ('TQQQ', 'BOXX')]
                     if hedge_assets:
@@ -744,9 +783,10 @@ def run_simulation(df_usd, initial_cap, target_w, port_name="", method='fast_rec
                 aw['TQQQ'] = 0
                 _rebalance(aw, p)
             elif state == 'CASH_USD':
+                # F2: TQQQ 몫만 현금 대기로 두고, 헤지자산(BOXX/gold)은 유지.
+                #     (기존엔 aw['BOXX']=0로 헤지까지 전량 매도 → 이후 100% TQQQ로 튀는 엣지 발생)
                 aw = base_w.copy()
                 aw['TQQQ'] = 0
-                aw['BOXX'] = 0
                 _rebalance(aw, p)
             executed = True
 
@@ -807,52 +847,6 @@ def run_simulation(df_usd, initial_cap, target_w, port_name="", method='fast_rec
                         pending = 'go_boxx'
                         trig = {'gspc': gspc, 'sma200': gsma, 'bubble': bub, 'note': 'buy_boxx'}
 
-            elif method == 'split_recover':
-                # 대피는 fast_recover와 동일. 복귀만 '대피 시점 버블'로 분기.
-                # [의도] 높은 거품에서 대피했으면 신중복귀(거품 빠질 때까지 기다림),
-                #        낮은 거품에서 대피했으면 그냥 빠른복귀.
-                if state == 'INVESTED':
-                    if bub >= BUBBLE_LIMIT and gspc < gsma:
-                        pending = 'go_cash'; trig = {'gspc': gspc, 'sma200': gsma, 'bubble': bub, 'note': 'exit'}
-                        exit_bubble = bub   # ★ 대피 시점 버블 기록
-
-                elif state in ['CASH_USD', 'CASH_BOXX'] and is_month_end:
-                    # 대피 버블이 임계 미만 = 저버블 대피 → 빠른복귀 / 임계 이상 = 고버블 대피 → 신중복귀
-                    use_fast = (exit_bubble is None or exit_bubble < bubble_fast_threshold)
-                    spx_ok = gspc > gsma
-                    if use_fast:
-                        # ── 저버블 대피 → 기존 빠른복귀와 100% 동일 ──
-                        if bub < BUBBLE_LIMIT:
-                            ndx_ok = ndx > nsma
-                            if spx_ok or ndx_ok:
-                                who = 'S&P+NDX' if (spx_ok and ndx_ok) else ('S&P' if spx_ok else 'NDX')
-                                pending = 'go_invest_from_usd' if state == 'CASH_USD' else 'go_invest_from_boxx'
-                                trig = {'gspc': gspc, 'sma200': gsma, 'bubble': bub, 'ndx': ndx, 'ndx_sma200': nsma, 'note': f'fast_recover_{who}'}
-                        else:
-                            if spx_ok:
-                                pending = 'go_invest_from_usd' if state == 'CASH_USD' else 'go_invest_from_boxx'
-                                trig = {'gspc': gspc, 'sma200': gsma, 'bubble': bub, 'note': 'recover_spx_only'}
-                    else:
-                        # ── 고버블 대피 → 신중복귀 ──
-                        # 출구(B-2, 새 숫자 없음): 둘 중 하나면 복귀.
-                        #   ① 버블<1.30 (거품 완전히 빠짐) + S&P/NDX 200일선 회복
-                        #   ② 버블이 대피 시점보다 낮아짐(거품 줄어듦) + S&P 200일선 회복
-                        #      → ②가 흡수상태(1.30 안 와도 영원히 갇힘)를 막는 탈출구.
-                        if bub < BUBBLE_LIMIT:
-                            ndx_ok = ndx > nsma
-                            if spx_ok or ndx_ok:
-                                who = 'S&P+NDX' if (spx_ok and ndx_ok) else ('S&P' if spx_ok else 'NDX')
-                                pending = 'go_invest_from_usd' if state == 'CASH_USD' else 'go_invest_from_boxx'
-                                trig = {'gspc': gspc, 'sma200': gsma, 'bubble': bub, 'ndx': ndx, 'ndx_sma200': nsma, 'note': f'slow_recover_{who}'}
-                        elif (exit_bubble is not None and bub < exit_bubble and spx_ok):
-                            pending = 'go_invest_from_usd' if state == 'CASH_USD' else 'go_invest_from_boxx'
-                            trig = {'gspc': gspc, 'sma200': gsma, 'bubble': bub, 'note': 'slow_recover_degear'}
-                        # else: 복귀 안 함 (거품이 대피 때보다 줄지도, 1.30 아래로도 안 옴 → 계속 대기)
-
-                    if state == 'CASH_USD' and not pending:
-                        pending = 'go_boxx'
-                        trig = {'gspc': gspc, 'sma200': gsma, 'bubble': bub, 'note': 'buy_boxx'}
-
         latent = _calc_tax(hold, eq_p, p)
         history.append(max(0, _val(hold, cash, p) - tax_bill - latent))
 
@@ -893,271 +887,609 @@ def calc_stats(nav, ic):
     sharpe = (cagr - RISK_FREE_RATE) / vol if vol > 0 else 0
     return cagr, mdd, sharpe
 
+# ── [표 정렬 유틸] 한글(전각)=2칸으로 계산해 패딩 (칸 어긋남 방지) ──
+import unicodedata as _ud
+def _dw(s):
+    return sum(2 if _ud.east_asian_width(str(c)) in 'WF' else 1 for c in str(s))
+def _pad(s, width, align='^'):
+    s = str(s); gap = width - _dw(s)
+    if gap <= 0: return s
+    if align == '>': return ' ' * gap + s
+    if align == '<': return s + ' ' * gap
+    return ' ' * (gap // 2) + s + ' ' * (gap - gap // 2)
+
+# ── [F1 헬퍼] 포트에 맞는 부스터 비중 생성(B는 gold 금지, hedge=BOXX) ──
+def _boost_for(w):
+    hedge = 'gold' if 'gold' in w else ('BOXX' if 'BOXX' in w else None)
+    tq = RECOVER_BOOST['TQQQ']
+    if hedge is None:
+        return {'TQQQ': tq}
+    return {'TQQQ': tq, hedge: round(1 - tq, 10)}
+
+
 # ============================================================
 # [5. 실행]
 # ============================================================
-if __name__ == "__main__":
-    df = get_data()
 
-    for nm, w in [("A(gold)", W_A), ("B(BOXX)", W_B)]:
-        s = sum(w.values())
-        if abs(s - 1.0) > 1e-6:
-            print(f"  [경고] 포트 {nm} 비중 합 = {s:.2f} (1.00 아님 → 나머지는 미투자 현금)")
+'''
 
-    configs = [
-        ("FAST + gold(비과세)",  'fast_recover', W_A),
-        ("FAST + BOXX(양도세)",  'fast_recover', W_B),
-    ]
+# ============================================================================
+#  [임베드 2/2] VR 엔진 (laoer_vr_compare.py, __main__ 제외 · verbatim)
+# ============================================================================
+_VR_ENGINE_SRC = r'''
+# -*- coding: utf-8 -*-
+"""라오어 VR v2 (검증용 저장본 — 문서 verbatim의 핵심부)"""
+import os, sys, warnings
+import numpy as np
+import pandas as pd
+warnings.filterwarnings("ignore")
 
-    results = {}
-    for name, m, w in configs:
-        print(f"\n▷ {name} 시뮬레이션...")
-        nav, log = run_simulation(df, INITIAL_CAPITAL, w, name, method=m)
-        results[name] = (nav, log)
+FETCH_START = "1985-10-01"
+START_DATES = ["1986-08-11", "1994-01-02", "1998-01-02", "2000-01-02", "2010-02-11",
+               "2013-01-02", "2016-01-02", "2019-01-02", "2022-01-02", "2024-01-02"]
+END_DATE    = "2026-07-10"
+SIGNAL_LAG = 1
+RUN_HOLD, RUN_DCA, RUN_WD = "on", "on", "on"
+KILLSWITCH = "on"
+CHART_ON   = "on"
+CHART_MODE = "hold"
+CHART_START = "2010-02-11"
+def ON(x): return str(x).strip().lower() == "on"
 
-    nav_spy = run_bh_aftertax(df, INITIAL_CAPITAL, 'SPY')
-    nav_qqq = run_bh_aftertax(df, INITIAL_CAPITAL, 'QQQ')
-    nav_qld = run_bh_aftertax(df, INITIAL_CAPITAL, 'QLD')   # ★ QLD(2x) 벤치마크 추가
+HOLD_CAP, HOLD_POOL, HOLD_G, HOLD_LIMIT = 100000.0, 0.10, 10, 0.50
+DCA_INIT, DCA_MONTHLY, DCA_POOL, DCA_G, DCA_LIMIT = 500.0, 50.0, 0.00, 10, 0.75
+WD_CAP, WD_MONTHLY, WD_POOL, WD_G, WD_LIMIT = 100000.0, 300.0, 0.20, 20, 0.25
+LUMP_EVENTS = {}
+BAND_LOW, BAND_HIGH = 0.85, 1.15
+TAX_RATE, TAX_DEDUCTION = 0.22, 250.0
+BUBBLE_LIMIT = 1.30
+FAST_RECOVER = "on"
+SKILL_ON     = "off"
+B1_ON    = "on"
+B1_PCTL  = 0.75
+B1_WIN_Y = 10
+VOLTGT_ON       = "off"
+VOLTGT_TARGET   = 0.60
+VOLTGT_LOOKBACK = 20
+TQQQ_DRAG_MULT, TQQQ_DRAG_ADD = 2.0, 0.0095 + 0.015
+TQQQ_REAL_START, QQQ_REAL_START = "2010-02-11", "1999-03-10"
 
-    def stats_line(nav, log):
-        c, m, s = calc_stats(nav, INITIAL_CAPITAL)
-        n_daepi = int((log['액션'] == '대피(USD대기)').sum()) if not log.empty else 0
-        n_trade = len(log)
-        return nav.iloc[-1], c, m, s, n_daepi, n_trade
 
-    first_nav = list(results.values())[0][0]
-    yrs = round((first_nav.index[-1] - first_nav.index[0]).days / 365.25, 1)
-    sd = first_nav.index[0].strftime('%Y-%m-%d')
-    ed = first_nav.index[-1].strftime('%Y-%m-%d')
+def _drive_base():
+    if 'google.colab' in sys.modules:
+        try:
+            from google.colab import drive
+            drive.mount('/content/drive')
+            return '/content/drive/MyDrive/'
+        except Exception:
+            return ''
+    return ''
 
-    print("\n" + "=" * 104)
-    print(f"  📊 스마트 대기 + FAST — A(gold) vs B(BOXX) ({sd} ~ {ed}, {yrs}년)")
-    print(f"  자산: gold=KRX금현물(비과세), BOXX=박스스프레드(양도세, 단기채복제) / SPY·QQQ·QLD 세후")
-    print("=" * 104)
-    print(f"{'방식':^24} | {'최종자산($)':^16} | {'CAGR':^8} | {'MDD':^8} | {'샤프':^6} | {'대피수':^6} | {'총매매':^6}")
-    print("-" * 104)
-    for name, _, _ in configs:
-        nav, log = results[name]
-        fin, c, m, s, nd, nt = stats_line(nav, log)
-        print(f"{name:^24} | {fin:>16,.0f} | {c*100:>7.2f}% | {m*100:>7.2f}% | {s:>6.2f} | {nd:>6} | {nt:>6}")
 
-    for bname, bnav in [("SPY(세후, 참고)", nav_spy), ("QQQ(세후, 참고)", nav_qqq), ("QLD(세후, 참고)", nav_qld)]:
-        c, m, s = calc_stats(bnav, INITIAL_CAPITAL)
-        print(f"{bname:^24} | {bnav.iloc[-1]:>16,.0f} | {c*100:>7.2f}% | {m*100:>7.2f}% | {s:>6.2f} | {'-':>6} | {'-':>6}")
-    print("=" * 104)
+def _first(*c):
+    return next((x for x in c if x and os.path.exists(x)), None)
 
-    a_fin = results["FAST + gold(비과세)"][0].iloc[-1]
-    b_fin = results["FAST + BOXX(양도세)"][0].iloc[-1]
-    diff = a_fin - b_fin
-    ratio = (a_fin / b_fin - 1) * 100 if b_fin > 0 else 0
-    print(f"\n  ▶ A(gold) − B(BOXX) = {diff:>+,.0f}  ({ratio:+.1f}%)")
-    print(f"    {'A(gold) 우세' if diff > 0 else 'B(BOXX) 우세'}")
+def _flat(path, col):
+    df = pd.read_csv(path)
+    df[df.columns[0]] = pd.to_datetime(df[df.columns[0]])
+    df = df.set_index(df.columns[0]).sort_index()
+    if col in df.columns:
+        return df[col].dropna()
+    tail = col.split("|")[-1]
+    for c in df.columns:
+        if str(c).endswith("|" + tail) or str(c).lower().startswith(tail.lower()):
+            return df[c].dropna()
+    return None
 
-    # ============================================================
-    # [5b. 복귀규칙 비교] 대피 시점 버블에 따라 빠른복귀 vs 신중복귀(버블<1.30) 분기
-    #   A(gold) 기준으로, 현재(빠른복귀) vs split(여러 임계값)을 나란히 비교.
-    #   split: 대피버블 ≥ 임계값 → 기존 빠른복귀 / 미만 → 버블<1.30에서만 복귀
-    # ============================================================
-    print("\n" + "=" * 104)
-    print("  🔬 [복귀규칙 비교] A(gold) 기준 — '대피 시점 버블'로 복귀 방식 분기 효과")
-    print("     split: 대피버블 ≥ 임계값이면 기존 빠른복귀, 미만이면 버블<1.30 아래로 와야만 복귀")
-    print("=" * 104)
-    print(f"{'복귀규칙':^30} | {'최종자산($)':^16} | {'CAGR':^8} | {'MDD':^8} | {'샤프':^6} | {'대피수':^6} | {'총매매':^6}")
-    print("-" * 104)
-    _bnav, _blog = results["FAST + gold(비과세)"]
-    _bc, _bm, _bs = calc_stats(_bnav, INITIAL_CAPITAL)
-    _bnd = int((_blog['액션'] == '대피(USD대기)').sum()) if not _blog.empty else 0
-    print(f"{'현재(빠른복귀, 기준)':^30} | {_bnav.iloc[-1]:>16,.0f} | {_bc*100:>7.2f}% | {_bm*100:>7.2f}% | {_bs:>6.2f} | {_bnd:>6} | {len(_blog):>6}")
-    for _thr in SPLIT_THRESHOLDS:
-        _nav, _log = run_simulation(df, INITIAL_CAPITAL, W_A, f"split_{_thr}",
-                                    method='split_recover', bubble_fast_threshold=_thr)
-        _c, _m, _s = calc_stats(_nav, INITIAL_CAPITAL)
-        _nd = int((_log['액션'] == '대피(USD대기)').sum()) if not _log.empty else 0
-        _tag = (f"split 임계={_thr:g} (항상신중)" if _thr >= 90 else f"split 임계={_thr:g}")
-        print(f"{_tag:^30} | {_nav.iloc[-1]:>16,.0f} | {_c*100:>7.2f}% | {_m*100:>7.2f}% | {_s:>6.2f} | {_nd:>6} | {len(_log):>6}")
-    print("=" * 104)
-    print("  · '항상신중'은 모든 대피를 버블<1.30 복귀로 처리 → 박사님 원안(복귀를 버블1.30 이하로만)에 해당")
-
-    # ============================================================
-    # [5f. 복귀 부스터] 빠른복귀(NDX 단독, S&P 아직 200일선 아래) 진입 시 TQQQ 더 싣기
-    #   A=S&P 200일선 회복 시 환원 / B=연례 리밸런싱 시 환원. 재원은 금에서.
-    # ============================================================
-    print("\n" + "=" * 104)
-    print("  🔬 [복귀 부스터B] A(gold) 기준 — NDX 단독 빠른복귀 진입 순간 TQQQ↑(금↓)로 부스터")
-    print(f"     평상시 {int(W_A['TQQQ']*100)}:{int(W_A['gold']*100)} → 부스터 {int(RECOVER_BOOST['TQQQ']*100)}:{int(RECOVER_BOOST['gold']*100)} "
-          f"(NDX 단독복귀 시만). 환원: 연 1회 리밸런싱(12/31). ★채택")
-    print("=" * 104)
-    print(f"{'방식':^26} | {'최종자산($)':^16} | {'CAGR':^8} | {'MDD':^8} | {'샤프':^6} | {'대피수':^6} | {'총매매':^6}")
-    print("-" * 104)
-    print(f"{'현재(부스터 없음, 기준)':^26} | {_bnav.iloc[-1]:>16,.0f} | {_bc*100:>7.2f}% | {_bm*100:>7.2f}% | {_bs:>6.2f} | {_bnd:>6} | {len(_blog):>6}")
-    _nav, _log = run_simulation(df, INITIAL_CAPITAL, W_A, '부스터B(연례환원)', method='boost_until_annual')
-    _c, _m, _s = calc_stats(_nav, INITIAL_CAPITAL)
-    _nd = int((_log['액션'] == '대피(USD대기)').sum()) if not _log.empty else 0
-    _nboost = int(_log['액션'].astype(str).str.contains('부스터60:40').sum()) if not _log.empty else 0
-    print(f"{'부스터B(연례환원)':^26} | {_nav.iloc[-1]:>16,.0f} | {_c*100:>7.2f}% | {_m*100:>7.2f}% | {_s:>6.2f} | {_nd:>6} | {len(_log):>6}")
-    print(f"   └ 부스터 발동 횟수: {_nboost}회 (NDX 단독복귀 시점)")
-    print("=" * 104)
-    print(f"  · RECOVER_BOOST = {RECOVER_BOOST} 로 부스터 비율 자유 조절. 발동 0회면 그 기간에 NDX 단독복귀가 없었다는 뜻.")
-    print(f"  · 부스터B 효과: CAGR {(_c-_bc)*100:+.2f}%p / 최종 {(_nav.iloc[-1]/_bnav.iloc[-1]-1)*100:+.1f}% (MDD·샤프 불변=순상방)")
-
-    # ============================================================
-    # [5g. 다중 윈도우 강건성] 여러 시작점에서 각 전략을 돌려 '기간 의존성' 점검
-    #   한 창에서만 좋은 전략(시작점 편향/과최적화)을 걸러낸다.
-    #   각 셀: 해당 전략 CAGR − 현재(fast_recover) CAGR  (양수=현재보다 우월)
-    # ============================================================
-    print("\n" + "=" * 104)
-    print("  🔬 [다중 윈도우 강건성] 시작점별 'CAGR 우위(전략 − 현재)' — 모든 창에서 +라야 진짜")
-    print("     양수(+)=그 기간에 현재보다 우월 / 음수(−)=현재보다 열위. 한 칸이라도 크게 −면 기간 의존.")
-    print("=" * 104)
-
-    _df_full = get_data('FULL')
-    _windows = ['1986-08-01', '1995-01-01', '2000-01-01', '2005-01-01', '2010-01-01']
-
-    # 평가할 전략: (라벨, method, 추가 kwargs)
-    _strats = [
-        ("split 임계1.5",   'split_recover',     {'bubble_fast_threshold': 1.5}),
-        ("split 임계2.0",   'split_recover',     {'bubble_fast_threshold': 2.0}),
-        ("부스터B 연례",    'boost_until_annual',{}),
-    ]
-
-    # 헤더
-    _hdr = f"{'전략 \\ 시작점':^18} |"
-    for w in _windows:
-        _hdr += f" {w[:4]:^8} |"
-    print(_hdr)
-    print("-" * 104)
-
-    # 각 윈도우의 현재(fast_recover) CAGR을 먼저 계산(기준선)
-    _base_cagr = {}
-    _base_label = f"{'현재 CAGR(기준)':^18} |"
-    for w in _windows:
-        _d = _df_full.loc[w:]
-        if len(_d) < 250:
-            _base_cagr[w] = None; _base_label += f" {'N/A':^8} |"; continue
-        _nav, _ = run_simulation(_d, INITIAL_CAPITAL, W_A, method='fast_recover')
-        _c, _, _ = calc_stats(_nav, INITIAL_CAPITAL)
-        _base_cagr[w] = _c
-        _base_label += f" {_c*100:>6.1f}% |"
-    print(_base_label)
-    print("-" * 104)
-
-    # 각 전략의 윈도우별 (전략 CAGR − 현재 CAGR)
-    for _lbl, _m, _kw in _strats:
-        _row = f"{_lbl:^18} |"
-        for w in _windows:
-            if _base_cagr[w] is None:
-                _row += f" {'N/A':^8} |"; continue
-            _d = _df_full.loc[w:]
-            _nav, _ = run_simulation(_d, INITIAL_CAPITAL, W_A, method=_m, **_kw)
-            _c, _, _ = calc_stats(_nav, INITIAL_CAPITAL)
-            _delta = (_c - _base_cagr[w]) * 100
-            _mark = '+' if _delta >= 0 else ''
-            _row += f" {_mark}{_delta:>5.2f}%p|"
-        print(_row)
-    print("=" * 104)
-    print("  · 모든 칸이 + → 기간에 강건(진짜 우위). 칸마다 부호가 갈리면 → 시작점 편향(그 창에만 맞음).")
-    print("  · 부스터는 NDX 단독복귀가 있는 창에서만 효과(없는 창은 0에 가까움).")
-
-    # ============================================================
-    # [5h. 고버블 구간 절단 검증] '고버블에서 진짜 효과 있나'를 직접 본다.
-    #   다중윈도우는 시작점부터 '끝까지'라 고버블 효과가 후속 기간에 희석됨.
-    #   여기서는 역사적 고버블 폭락 구간만 잘라(시작~바닥), 그 구간 안에서
-    #   현재 vs 동적C vs split vs 게이트의 '낙폭(MDD)·구간수익'을 비교한다.
-    #   → 고버블 방어 전략이면 그 구간에서 MDD가 작아야(덜 맞아야) 한다.
-    # ============================================================
-    print("\n" + "=" * 104)
-    print("  🔬 [고버블 구간 절단] 역사적 폭락 구간만 떼서 — '그 구간에서 덜 맞았나' 직접 검증")
-    print("     핵심 = 구간 MDD(낙폭, 작을수록 방어 우수). 구간수익도 참고.")
-    print("=" * 104)
-
-    # (라벨, 시작, 끝) — 고버블 진입~바닥. 끝은 바닥 근처로 잡아 '폭락 구간'만 절단.
-    _crash_windows = [
-        ("2000 닷컴붕괴",  "2000-03-01", "2003-03-31"),
-        ("2007 금융위기",  "2007-10-01", "2009-03-31"),
-        ("2022 긴축폭락",  "2021-11-01", "2022-12-31"),
-    ]
-    # 비교 전략: (라벨, method, kwargs) — 보험용 split만 현재와 비교
-    _crash_strats = [
-        ("현재(빠른복귀)",  'fast_recover',      {}),
-        ("split 임계1.5",   'split_recover',     {'bubble_fast_threshold': 1.5}),
-        ("split 임계2.0",   'split_recover',     {'bubble_fast_threshold': 2.0}),
-    ]
-
-    for _wlabel, _wstart, _wend in _crash_windows:
-        _seg = df.loc[_wstart:_wend]
-        if len(_seg) < 30:
-            print(f"\n  [{_wlabel}] 데이터 부족 — 건너뜀")
-            continue
-        _b0 = _seg['Bubble_Value'].iloc[0]
-        _bmin = _seg['Bubble_Value'].min()
-        _bmax = _seg['Bubble_Value'].max()
-        print(f"\n  ── [{_wlabel}] {_wstart} ~ {_wend} "
-              f"(구간 버블 {_bmin:.2f}~{_bmax:.2f}, 시작 {_b0:.2f}) ──")
-        print(f"  {'전략':^18} | {'구간수익':^10} | {'구간MDD':^10} | {'최종/초기':^10}")
-        print("  " + "-" * 56)
-        for _slabel, _sm, _skw in _crash_strats:
-            _nav, _ = run_simulation(_seg, INITIAL_CAPITAL, W_A, _slabel, method=_sm, **_skw)
-            _ret = (_nav.iloc[-1] / _nav.iloc[0] - 1) * 100
-            _mdd = (_nav / _nav.cummax() - 1).min() * 100
-            print(f"  {_slabel:^18} | {_ret:>+8.1f}% | {_mdd:>8.1f}% | {_nav.iloc[-1]/_nav.iloc[0]:>8.3f}")
-    print("\n" + "=" * 104)
-    print("  · 해석: 고버블 방어가 목적이면 그 구간 MDD가 '현재'보다 작아야(덜 맞아야) 효과 있는 것.")
-    print("  · 구간수익이 현재보다 높으면서 MDD도 작으면 = 그 구간에선 확실히 우수.")
-    print("  · 단, 이건 '구간을 미리 안다'는 가정. 실전은 '언제 그 구간인지 모름'이 핵심 난점.")
-
-    for name, _, _ in configs:
-        log = results[name][1]
-        if not log.empty:
-            print(f"\n[{name} 매매로그]\n" + log.to_string(index=False))
-    # ============================================================
-    # [6. 차트] NAV(로그) + Drawdown  ← 이 블록을 기존 코드 맨 끝에 붙여넣기
-    #   (if __name__ == "__main__": 안, 매매로그 출력 다음 / 들여쓰기 4칸)
-    # ============================================================
-    import matplotlib.gridspec as gridspec
-
-    A_name = "FAST + gold(비과세)"
-    B_name = "FAST + BOXX(양도세)"
-    nav_a = results[A_name][0]
-    nav_b = results[B_name][0]
-
-    def _dd(nav):
-        return (nav / nav.cummax() - 1.0) * 100.0
-
-    ca, ma, sa = calc_stats(nav_a, INITIAL_CAPITAL)
-    cb, mb, sb = calc_stats(nav_b, INITIAL_CAPITAL)
-
-    fig = plt.figure(figsize=(15, 9))
-    gs = gridspec.GridSpec(2, 1, height_ratios=[3, 1], hspace=0.18)
-
-    # ── 상단: NAV (로그 스케일) ──
-    ax1 = fig.add_subplot(gs[0])
-    ax1.plot(nav_a.index, nav_a.values, color='crimson', lw=1.8,
-             label=f'A: FAST+gold (CAGR {ca*100:.1f}%, MDD {ma*100:.1f}%)')
-    ax1.plot(nav_b.index, nav_b.values, color='steelblue', lw=1.5, ls='--',
-             label=f'B: FAST+BOXX (CAGR {cb*100:.1f}%, MDD {mb*100:.1f}%)')
-    ax1.plot(nav_spy.index, nav_spy.values, color='gray', lw=1.0, ls=':', label='SPY (세후)')
-    ax1.plot(nav_qqq.index, nav_qqq.values, color='purple', lw=1.0, ls=':', label='QQQ (세후)')
-    ax1.plot(nav_qld.index, nav_qld.values, color='green', lw=1.0, ls=':', label='QLD (세후)')   # ★ QLD 추가
-    ax1.set_yscale('log')
-    ax1.set_ylabel('NAV (USD, Log)')
-    ax1.set_title(f'{yrs}년 백테스트 ({sd} ~ {ed}) — A:FAST+gold(비과세) vs B:FAST+BOXX(양도세)')
-    ax1.legend(loc='upper left')
-    ax1.grid(True, which='both', alpha=0.3)
-
-    # ── 하단: Drawdown (%) ──
-    ax2 = fig.add_subplot(gs[1], sharex=ax1)
-    dd_a = _dd(nav_a)
-    dd_b = _dd(nav_b)
-    ax2.fill_between(dd_a.index, dd_a.values, 0, color='crimson', alpha=0.20, label='A MDD')
-    ax2.plot(dd_b.index, dd_b.values, color='steelblue', lw=1.0, ls='--', label='B MDD')
-    ax2.set_ylabel('DD (%)')
-    ax2.set_title('Drawdown')
-    ax2.legend(loc='lower left')
-    ax2.grid(True, alpha=0.3)
-
+def get_sources(db):
+    ndx = irx = gspc = qqq_real = tqqq_real = m0 = None
     try:
-        plt.savefig('backtest_chart.png', dpi=120, bbox_inches='tight')
-        print("\n차트 저장: backtest_chart.png")
-    except Exception:
-        pass
-    plt.show()
+        import yfinance as yf
+        def _c(t, s):
+            d = yf.download(t, start=s, end=END_DATE, auto_adjust=True, progress=False)["Close"]
+            d = d.squeeze() if hasattr(d, "squeeze") else d
+            d.index = pd.to_datetime(d.index).tz_localize(None)
+            return d.dropna()
+        ndx = _c("^NDX", FETCH_START); irx = _c("^IRX", FETCH_START); gspc = _c("^GSPC", FETCH_START)
+        qqq_real = _c("QQQ", QQQ_REAL_START); tqqq_real = _c("TQQQ", TQQQ_REAL_START)
+        print("  · 지수: yfinance 실시간")
+    except Exception as e:
+        print(f"  · yfinance 불가({str(e)[:36]}) → 캐시 폴백")
+    if ndx is None or gspc is None:
+        bp = _first("base_indices.csv", db + "price_cache_base_indices.csv",
+                    "price_cache_base_indices.csv")
+        if bp:
+            ndx = ndx if ndx is not None else _flat(bp, "Close|^NDX")
+            irx = irx if irx is not None else _flat(bp, "Close|^IRX")
+            gspc = gspc if gspc is not None else _flat(bp, "Close|^GSPC")
+            print(f"  · base_indices 캐시: {bp}")
+    if qqq_real is None:
+        qp = _first("qqq_drive.csv", db + "price_cache_tk_QQQ.csv", "price_cache_tk_QQQ.csv")
+        if qp: qqq_real = _flat(qp, "Close|QQQ")
+    if tqqq_real is None:
+        tp = _first("tqqq_drive.csv", db + "price_cache_tk_TQQQ.csv", "price_cache_tk_TQQQ.csv")
+        if tp: tqqq_real = _flat(tp, "Close|TQQQ")
+    mp = _first("m0_full.csv", db + "m0_full.csv")
+    if mp:
+        md = pd.read_csv(mp)
+        md.index = pd.to_datetime(md[md.columns[0]])
+        m0 = pd.to_numeric(md[md.columns[-1]], errors="coerce").dropna()
+    if ndx is None or gspc is None or m0 is None:
+        raise RuntimeError("^NDX/^GSPC/M0 확보 실패.")
+    return ndx, irx, gspc, qqq_real, tqqq_real, m0
+
+
+def build_data(db=""):
+    ndx, irx, gspc, qqq_real, tqqq_real, m0 = get_sources(db)
+    idx = pd.date_range(ndx.index[0], ndx.index[-1], freq="B")
+    ndx = ndx.reindex(idx).ffill(); gspc = gspc.reindex(idx).ffill()
+    irx = (irx.reindex(idx).ffill().bfill() if irx is not None
+           else pd.Series(2.5, index=idx))
+    m0 = m0.reindex(idx).ffill().bfill()
+
+    def splice(syn, real, name):
+        if real is None or real.empty:
+            print(f"  · {name} 실데이터 없음 → 합성만"); return syn
+        real = real.reindex(idx).ffill(); rf = real.first_valid_index()
+        if rf is None or pd.isna(syn.loc[rf]): return syn
+        sc = syn.loc[rf] / real.loc[rf]
+        out = syn.copy(); mk = idx >= rf
+        out[mk] = (real * sc).reindex(idx[mk]).ffill()
+        print(f"  · {name} 스플라이스 @ {rf.date()} (scale {sc:.3f})")
+        return out
+
+    qqq = splice((1 + ndx.pct_change().fillna(0).clip(-.5, .5)).cumprod() * 100, qqq_real, "QQQ")
+    r_ndx = qqq.pct_change().fillna(0)
+    daily_lev = np.where(r_ndx <= -0.3333, -0.99, r_ndx * 3)
+    daily_cost = (irx / 100 + 0.0084) / 252
+    tqqq_syn = (1 + (pd.Series(daily_lev, index=qqq.index) - daily_cost)).cumprod() * 100
+    tqqq = splice(tqqq_syn, tqqq_real, "TQQQ")
+
+    out = pd.DataFrame({"TQQQ": tqqq, "QQQ": qqq, "GSPC": gspc, "NDX": ndx, "IRX": irx,
+                        "GSMA": gspc.rolling(200).mean(), "NSMA": ndx.rolling(200).mean(),
+                        "BUB": gspc / m0}).dropna()
+
+    w = int(252 * B1_WIN_Y)
+    out["BUB_PCTL"] = out["BUB"].rolling(w, min_periods=int(252 * 3)).apply(
+        lambda x: (x[-1] >= x).mean(), raw=True)
+
+    tqqq_real_al = tqqq_real.reindex(out.index).ffill() if tqqq_real is not None else None
+    ret_syn = out["TQQQ"].pct_change()
+    if tqqq_real_al is not None:
+        ret_real = tqqq_real_al.pct_change()
+        ret_for_rv = ret_real.where(ret_real.notna(), ret_syn)
+    else:
+        ret_for_rv = ret_syn
+    out["RV"] = ret_for_rv.rolling(VOLTGT_LOOKBACK).std() * np.sqrt(252)
+    return out
+
+
+def split_cycles(index):
+    first = index[0]
+    dss = (first.weekday() - 5) % 7
+    anchor = (first - pd.Timedelta(days=dss)).normalize()
+    cyc, ck, cur = [], None, []
+    for ts in index:
+        k = (ts.normalize() - anchor).days // 14
+        if k != ck:
+            if cur: cyc.append(cur)
+            cur, ck = [], k
+        cur.append(ts)
+    if cur: cyc.append(cur)
+    return cyc
+
+
+def _signals(d):
+    lag = int(SIGNAL_LAG)
+    sh = (lambda s: s.shift(lag)) if lag > 0 else (lambda s: s)
+    dts = list(d.index)
+    me_raw = pd.Series(
+        [(i < len(dts) - 1 and dts[i + 1].month != dts[i].month) for i in range(len(dts))],
+        index=d.index)
+    sig = {
+        "G":    sh(d["GSPC"]),
+        "GS":   sh(d["GSMA"]),
+        "NX":   sh(d["NDX"]),
+        "NS":   sh(d["NSMA"]),
+        "BU":   sh(d["BUB"]),
+        "PCTL": sh(d["BUB_PCTL"]) if "BUB_PCTL" in d.columns else pd.Series(np.nan, index=d.index),
+        "RV":   sh(d["RV"]) if "RV" in d.columns else pd.Series(np.nan, index=d.index),
+        "ME":   sh(me_raw.astype(float)).fillna(0.0).astype(bool),
+    }
+    return sig
+
+
+def _vscale(sig, day):
+    if not ON(VOLTGT_ON):
+        return 1.0
+    rv = sig["RV"].get(day, np.nan)
+    if pd.isna(rv) or rv <= 0:
+        return 1.0
+    return min(1.0, VOLTGT_TARGET / float(rv))
+
+
+def _exit_sig(sig, dd):
+    g = sig["G"].get(dd, np.nan); gs = sig["GS"].get(dd, np.nan)
+    if pd.isna(g) or pd.isna(gs) or g >= gs:
+        return False
+    bub = sig["BU"].get(dd, np.nan)
+    if not pd.isna(bub) and bub >= BUBBLE_LIMIT:
+        return True
+    if ON(B1_ON):
+        pc = sig["PCTL"].get(dd, np.nan)
+        if not pd.isna(pc) and pc >= B1_PCTL:
+            return True
+    return False
+
+
+def _recover_sig(sig, dd):
+    if not bool(sig["ME"].get(dd, False)):
+        return False
+    g = sig["G"].get(dd, np.nan); gs = sig["GS"].get(dd, np.nan)
+    if pd.isna(g) or pd.isna(gs):
+        return False
+    spx_ok = g > gs
+    bub = sig["BU"].get(dd, np.nan)
+    if not pd.isna(bub) and bub < BUBBLE_LIMIT:
+        nx = sig["NX"].get(dd, np.nan); ns = sig["NS"].get(dd, np.nan)
+        ndx_ok = (not pd.isna(nx) and not pd.isna(ns) and nx > ns)
+        return spx_ok or (ON(FAST_RECOVER) and ndx_ok)
+    return spx_ok
+
+
+def run_vr(d, init_capital, pool_ratio, G, buy_limit, dep=0.0, wd=0.0, killswitch=True):
+    px = d["TQQQ"]; flow = dep - wd
+    sig = _signals(d)
+    stock = init_capital * (1 - pool_ratio); pool = init_capital * pool_ratio
+    shares = stock / float(px.iloc[0]); V = shares * float(px.iloc[0])
+    cum_in = cum_out = 0.0
+    nb = ns = n_exit = n_rec = 0
+    daily = []; state = "INVESTED"; cf_on_day = {}
+    lumps = sorted((pd.Timestamp(k), float(v)) for k, v in LUMP_EVENTS.items()); li = 0
+    while li < len(lumps) and lumps[li][0] < px.index[0]:
+        li += 1
+    for cd in split_cycles(px.index):
+        p0 = float(px.loc[cd[0]])
+        while li < len(lumps) and lumps[li][0] <= cd[0] and state == "INVESTED":
+            amt = lumps[li][1]; ev0 = shares * p0; total = ev0 + pool
+            if total > 0 and V > 0:
+                if amt < 0 and -amt >= total:
+                    cum_out += total
+                    cf_on_day[cd[0]] = cf_on_day.get(cd[0], 0.0) - total
+                    shares = pool = 0.0
+                    for rdd in px.index[px.index >= cd[0]]:
+                        daily.append((rdd, 0.0))
+                    li = len(lumps); state = "BUST"; break
+                w = ev0 / total; pv = pool / V
+                shares += (amt * w) / p0; pool += amt * (1 - w)
+                if pool < 0:
+                    need = -pool; ss = min(need / p0, shares)
+                    shares -= ss; pool += ss * p0
+                    if pool < 0: pool = 0.0
+                V = (pool / pv) if pv > 1e-12 else (shares * p0 + pool)
+                if amt > 0: cum_in += amt
+                else: cum_out += -amt
+                cf_on_day[cd[0]] = cf_on_day.get(cd[0], 0.0) + amt
+            li += 1
+        if state == "BUST":
+            break
+        if wd > 0 and state == "INVESTED" and (shares * p0 + pool) < wd:
+            cum_out += max(0.0, shares * p0 + pool)
+            shares = pool = 0.0
+            for rdd in px.index[px.index >= cd[0]]:
+                daily.append((rdd, 0.0))
+            break
+        if state == "INVESTED":
+            pool += flow; cum_in += dep; cum_out += wd
+            if flow != 0:
+                cf_on_day[cd[0]] = cf_on_day.get(cd[0], 0.0) + flow
+            if pool < 0:
+                need = -pool; sell_sh = min(need / p0, shares)
+                shares -= sell_sh; pool += sell_sh * p0
+                if pool < 0: pool = 0.0
+        Veff = V * _vscale(sig, cd[0])
+        bmin, bmax = Veff * BAND_LOW, Veff * BAND_HIGH
+        budget = max(0, pool) * buy_limit; used = 0.0
+        for dd in cd:
+            p = float(px.loc[dd])
+            if killswitch:
+                if state == "INVESTED" and _exit_sig(sig, dd):
+                    pool += shares * p; shares = 0.0
+                    state = "CASH"; n_exit += 1
+                    daily.append((dd, pool)); continue
+                if state == "CASH" and _recover_sig(sig, dd):
+                    buy = min(Veff, pool)
+                    shares = buy / p; pool -= buy
+                    state = "INVESTED"; n_rec += 1
+            if state == "INVESTED":
+                ev = shares * p
+                if ev < bmin:
+                    b = min(bmin - ev, pool, max(0, budget - used))
+                    if b > 1e-9:
+                        shares += b / p; pool -= b; used += b; nb += 1
+                elif ev > bmax:
+                    s = ev - bmax
+                    if s > 1e-9:
+                        shares -= s / p; pool += s; ns += 1
+            daily.append((dd, shares * p + pool))
+        if state == "INVESTED":
+            E = shares * float(px.loc[cd[-1]])
+            skill = (E - V) / (2 * np.sqrt(G)) if ON(SKILL_ON) else 0.0
+            V = V + pool / G + skill + flow
+    dd_ = pd.DataFrame(daily, columns=["d", "t"]).set_index("d")
+    mdd = float((dd_.t / dd_.t.cummax() - 1).min())
+    nav = float(dd_.t.iloc[-1])
+    yrs = (dd_.index[-1] - dd_.index[0]).days / 365.25
+    cum = init_capital + cum_in
+    result = nav + cum_out
+    tax = max(0, result - cum - TAX_DEDUCTION) * TAX_RATE
+    at = result - tax
+    cagr = (at / cum) ** (1 / yrs) - 1 if at > 0 else float('nan')
+    nav_s = dd_.t; prev = nav_s.shift(1)
+    cf = pd.Series(0.0, index=nav_s.index)
+    for dt, amt in cf_on_day.items():
+        if dt in cf.index:
+            cf.loc[dt] = amt
+    ret = ((nav_s - cf) / prev - 1.0).dropna()
+    ret = ret[np.isfinite(ret)]
+    rf = float(d["IRX"].reindex(dd_.index).ffill().mean()) / 100.0 if "IRX" in d.columns else 0.0
+    sd = ret.std()
+    sharpe = ((ret.mean() - rf / 252) / sd * np.sqrt(252)) if sd > 0 else float('nan')
+    return dict(yrs=yrs, nav=nav, result=result, aftertax=at, cum=cum, cum_out=cum_out,
+                cagr=cagr, mdd=mdd, sharpe=sharpe, nb=nb, ns=ns, n_exit=n_exit, n_rec=n_rec)
+
+
+def run_hold_bench(px, init_capital, dep=0.0, wd=0.0):
+    shares = init_capital / float(px.iloc[0]); cum_in = cum_out = 0.0
+    for cd in split_cycles(px.index):
+        p0 = float(px.loc[cd[0]])
+        if dep > 0: shares += dep / p0; cum_in += dep
+        if wd > 0:  shares -= min(wd / p0, shares); cum_out += wd
+    nav = shares * float(px.iloc[-1])
+    cum = init_capital + cum_in; result = nav + cum_out
+    tax = max(0, result - cum - TAX_DEDUCTION) * TAX_RATE
+    return result - tax
+
+
+def _nav_series_vr(d, init, pool_ratio, G, buy_limit, killswitch, dep=0.0, wd=0.0):
+    px = d["TQQQ"]; flow = dep - wd
+    sig = _signals(d)
+    stock = init * (1 - pool_ratio); pool = init * pool_ratio
+    shares = stock / float(px.iloc[0]); V = shares * float(px.iloc[0])
+    daily = []; state = "INVESTED"
+    for cd in split_cycles(px.index):
+        p0 = float(px.loc[cd[0]])
+        if wd > 0 and state == "INVESTED" and (shares * p0 + pool) < wd:
+            for rdd in px.index[px.index >= cd[0]]:
+                daily.append((rdd, 0.0))
+            break
+        if state == "INVESTED":
+            pool += flow
+            if pool < 0:
+                need = -pool; ss = min(need / p0, shares)
+                shares -= ss; pool += ss * p0
+                if pool < 0: pool = 0.0
+        Veff = V * _vscale(sig, cd[0])
+        bmin, bmax = Veff * BAND_LOW, Veff * BAND_HIGH
+        budget = max(0, pool) * buy_limit; used = 0.0
+        for dd in cd:
+            p = float(px.loc[dd])
+            if killswitch:
+                if state == "INVESTED" and _exit_sig(sig, dd):
+                    pool += shares * p; shares = 0.0; state = "CASH"
+                    daily.append((dd, pool)); continue
+                if state == "CASH" and _recover_sig(sig, dd):
+                    buy = min(Veff, pool); shares = buy / p; pool -= buy; state = "INVESTED"
+            if state == "INVESTED":
+                ev = shares * p
+                if ev < bmin:
+                    b = min(bmin - ev, pool, max(0, budget - used))
+                    if b > 1e-9:
+                        shares += b / p; pool -= b; used += b
+                elif ev > bmax:
+                    s = ev - bmax
+                    if s > 1e-9:
+                        shares -= s / p; pool += s
+            daily.append((dd, shares * p + pool))
+        if state == "INVESTED":
+            E = shares * float(px.loc[cd[-1]])
+            skill = (E - V) / (2 * np.sqrt(G)) if ON(SKILL_ON) else 0.0
+            V = V + pool / G + skill + flow
+    return pd.DataFrame(daily, columns=["d", "t"]).set_index("d")["t"]
+
+
+
+'''
+
+# ── 격리 네임스페이스에서 두 엔진 로드(각자의 __main__은 없음) ──
+FAST_NS = {'__name__': '_fast_engine'}
+exec(compile(_FAST_ENGINE_SRC, '<fast_engine>', 'exec'), FAST_NS)
+VR_NS = {'__name__': '_vr_engine'}
+exec(compile(_VR_ENGINE_SRC, '<vr_engine>', 'exec'), VR_NS)
+
+# ============================================================================
+#  [Phase 0 · 단일 파일] 블렌드 프론티어 오케스트레이션
+#  두 엔진(위에 임베드)을 격리 네임스페이스에서 실행 → 세후 NAV → 블렌드.
+# ============================================================================
+def _phase0_main():
+    import os, sys
+    import numpy as np
+    import pandas as pd
+
+    START = "2010-02-11"
+    W_GRID = [0.0, 0.25, 0.50, 0.75, 1.0]
+    RISK_FREE_RATE = 0.045
+    CRASH_WINDOWS = [("2018 Q4","2018-09-01","2018-12-31"),
+                     ("2020 COVID","2020-02-01","2020-04-30"),
+                     ("2022 긴축","2021-11-01","2022-12-31")]
+
+    def _dbase():
+        if 'google.colab' in sys.modules:
+            try:
+                from google.colab import drive
+                drive.mount('/content/drive'); return '/content/drive/MyDrive/'
+            except Exception:
+                return ''
+        return ''
+    DB = _dbase()
+
+    print("=" * 100)
+    print("  [Phase 0 · 단일파일] 두 엔진 직접 실행 → 블렌드 프론티어")
+    print("=" * 100)
+
+    # ---- FAST NAV (부스터B A(gold), fresh START, 세후) ----
+    print("\n▶ FAST 엔진 실행 (부스터B A(gold), fresh %s)..." % START)
+    _fget = FAST_NS['get_data']; _frun = FAST_NS['run_simulation']
+    _FIC = FAST_NS['INITIAL_CAPITAL']; _FWA = FAST_NS['W_A']; _FEND = FAST_NS.get('END_DATE', None)
+    df_full = _fget('FULL')
+    dff = df_full.loc[START:]
+    if _FEND: dff = dff[dff.index <= _FEND]
+    nav_fast, _ = _frun(dff, _FIC, _FWA, method='boost_until_annual')
+    nav_fast = nav_fast[nav_fast > 0].copy(); nav_fast.name = 'FAST'
+    print("  · FAST NAV: %s~%s (%d행), 최종 %s" %
+          (nav_fast.index[0].date(), nav_fast.index[-1].date(), len(nav_fast), format(nav_fast.iloc[-1], ",.0f")))
+
+    # ---- VR NAV (거치식 VR+KS, fresh START) : 세전경로 → FAST와 동일 잠재세 차감 ----
+    print("\n▶ VR 엔진 실행 (거치식 VR+KS, fresh %s)..." % START)
+    _vbuild = VR_NS['build_data']; _vnav = VR_NS['_nav_series_vr']; _vrun = VR_NS['run_vr']
+    _VON = VR_NS['ON']
+    _HC, _HP, _HG, _HL = VR_NS['HOLD_CAP'], VR_NS['HOLD_POOL'], VR_NS['HOLD_G'], VR_NS['HOLD_LIMIT']
+    _KS = VR_NS['KILLSWITCH']; _TR = VR_NS['TAX_RATE']; _TD = VR_NS['TAX_DEDUCTION']
+    _VEND = VR_NS.get('END_DATE', None)
+    dfv = _vbuild(DB)
+    sub = dfv[dfv.index >= START]
+    if _VEND: sub = sub[sub.index <= _VEND]
+    nav_pre = _vnav(sub, _HC, _HP, _HG, _HL, killswitch=_VON(_KS))
+    gain = nav_pre - _HC
+    tax = (gain - _TD).clip(lower=0) * _TR
+    nav_vr = (nav_pre - tax).clip(lower=0); nav_vr = nav_vr[nav_vr > 0].copy(); nav_vr.name = 'VR'
+    try:
+        _r = _vrun(sub, _HC, _HP, _HG, _HL, killswitch=_VON(_KS))
+        print("  · VR 세후 정합: 변환최종=%s vs run_vr.aftertax=%s (대피 %d회)" %
+              (format(nav_vr.iloc[-1], ",.0f"), format(_r['aftertax'], ",.0f"), _r['n_exit']))
+    except Exception as e:
+        print("  · [경고] VR 정합 확인 생략:", e)
+    print("  · VR NAV: %s~%s (%d행), 최종 %s" %
+          (nav_vr.index[0].date(), nav_vr.index[-1].date(), len(nav_vr), format(nav_vr.iloc[-1], ",.0f")))
+
+    # ---- 블렌드 코어 ----
+    def align_and_norm(a, b):
+        df = pd.concat([a.rename('VR'), b.rename('FAST')], axis=1).dropna()
+        if len(df) < 250: raise RuntimeError("공통구간 부족(%d행)" % len(df))
+        return df / df.iloc[0]
+    def blend_bh(df, w): return w*df['VR'] + (1-w)*df['FAST']
+    def blend_rebal(df, w):
+        ra = df['VR'].pct_change().fillna(0.0).values; rb = df['FAST'].pct_change().fillna(0.0).values
+        idx = df.index; ba, bb = w, 1.0-w; out = np.empty(len(idx))
+        for i in range(len(idx)):
+            ba *= (1+ra[i]); bb *= (1+rb[i]); total = ba+bb; out[i] = total
+            if i < len(idx)-1 and idx[i].year != idx[i+1].year: ba, bb = total*w, total*(1-w)
+        return pd.Series(out, index=idx)
+    def stats(nav, rf=RISK_FREE_RATE):
+        days = (nav.index[-1]-nav.index[0]).days
+        cagr = (nav.iloc[-1]/nav.iloc[0])**(365.0/days)-1 if days>0 else 0.0
+        mdd = (nav/nav.cummax()-1).min(); dr = nav.pct_change().dropna()
+        vol = dr.std()*np.sqrt(252); down = dr[dr<0]
+        dd = down.std()*np.sqrt(252) if len(down)>1 else np.nan
+        sharpe = (cagr-rf)/vol if vol>0 else np.nan
+        sortino = (cagr-rf)/dd if (dd is not None and dd>0) else np.nan
+        return dict(cagr=cagr, mdd=mdd, vol=vol, sharpe=sharpe, sortino=sortino, final=nav.iloc[-1])
+    def crash_mdd(nav, s, e):
+        seg = nav.loc[(nav.index>=s)&(nav.index<=e)]
+        if len(seg) < 5: return None
+        seg = seg/seg.iloc[0]; return (seg/seg.cummax()-1).min()
+
+    df = align_and_norm(nav_vr, nav_fast)
+    sd, ed = df.index[0].date(), df.index[-1].date()
+    yrs = (df.index[-1]-df.index[0]).days/365.25
+    print("\n" + "=" * 100)
+    print("  [Phase 0] 블렌드 프론티어 | 공통구간 %s ~ %s (%.1f년, %d행)" % (sd, ed, yrs, len(df)))
+    print("  w = VR 비중 (1-w = FAST). 0=순수FAST · 1=순수VR. 둘 다 세후·fresh %s 시작" % START)
+    print("=" * 100)
+
+    rows = []
+    for w in W_GRID:
+        for mode, nav in [('BH', blend_bh(df, w)), ('Rebal', blend_rebal(df, w))]:
+            rows.append(dict(w=w, mode=mode, **stats(nav)))
+    fr = pd.DataFrame(rows)
+    def _f(v, pct=True):
+        if pd.isna(v): return "   n/a"
+        return ("%7.2f%%" % (v*100)) if pct else ("%7.2f" % v)
+    for mode in ['BH', 'Rebal']:
+        tag = '무리밸런싱(독립계좌·세후)' if mode=='BH' else '연례리밸런싱(★낙관: 리밸비용 미반영)'
+        print("\n  ── [%s] %s ──" % (mode, tag))
+        print("  %10s | %8s | %8s | %8s | %7s | %7s | %9s" %
+              ('w(VR)','CAGR','MDD','Vol','Sharpe','Sortino','최종배수'))
+        print("  " + "-"*82)
+        for _, r in fr[fr['mode']==mode].sort_values('w').iterrows():
+            lbl = ("%.2f" % r['w']) + (" (FAST)" if r['w']==0 else " (VR)" if r['w']==1 else "")
+            print("  %10s | %s | %s | %s | %7s | %7s | %7.2fx" %
+                  (lbl, _f(r['cagr']), _f(r['mdd']), _f(r['vol']),
+                   _f(r['sharpe'],False), _f(r['sortino'],False), r['final']))
+
+    print("\n" + "=" * 100)
+    print("  🔬 저버블 크래시창 MDD (BH 블렌드) — Phase 1(gold 통합)이 겨눌 표적")
+    print("     ※ MDD는 경로의존 → w에 단조 아닐 수 있음. 끝점 순서와 최소점 위치를 볼 것.")
+    print("=" * 100)
+    crows = []
+    hdr = "  %10s |" % '창' + "".join([" w=%.2f |" % w for w in W_GRID])
+    print(hdr); print("  " + "-"*(len(hdr)-2))
+    for cn, cs, ce in CRASH_WINDOWS:
+        line = "  %10s |" % cn
+        for w in W_GRID:
+            m = crash_mdd(blend_bh(df, w), cs, ce); crows.append(dict(window=cn, w=w, mdd=m))
+            line += (" %6.1f%%|" % (m*100)) if m is not None else "   n/a |"
+        print(line)
+    print("  " + "-"*(len(hdr)-2))
+    print("  · 값이 0에 가까울수록 낙폭 얕음. FAST 비중↑(w↓)에서 얕아지면 gold 완충 작동.")
+
+    fr.to_csv('phase0_frontier.csv', index=False)
+    pd.DataFrame(crows).to_csv('phase0_crash_mdd.csv', index=False)
+    df.rename(columns={'VR':'VR_norm','FAST':'FAST_norm'}).to_csv('phase0_navs.csv')
+    print("\n  저장: phase0_frontier.csv · phase0_crash_mdd.csv · phase0_navs.csv")
+
+    # 차트
+    try:
+        import matplotlib
+        in_nb = ('google.colab' in sys.modules)
+        if not in_nb: matplotlib.use('Agg')
+        import matplotlib.pyplot as plt, glob
+        from matplotlib import font_manager
+        fp = None
+        for pat in ["NanumGothic.ttf","/usr/share/fonts/truetype/nanum/*.ttf","/usr/share/fonts/**/NotoSansCJK*.otf"]:
+            h = glob.glob(pat, recursive=True)
+            if h: fp = h[0]; break
+        if fp:
+            font_manager.fontManager.addfont(fp)
+            plt.rcParams['font.family'] = font_manager.FontProperties(fname=fp).get_name()
+        plt.rcParams['axes.unicode_minus'] = False
+        fig, ax = plt.subplots(figsize=(10,7))
+        for mode, mk, cl in [('BH','o-','crimson'),('Rebal','s--','steelblue')]:
+            s2 = fr[fr['mode']==mode].sort_values('w')
+            ax.plot(s2['mdd']*100, s2['cagr']*100, mk, color=cl, lw=1.6, label='%s 블렌드' % mode)
+            for _, r in s2.iterrows():
+                ax.annotate("w=%.2f" % r['w'], (r['mdd']*100, r['cagr']*100),
+                            textcoords="offset points", xytext=(6,4), fontsize=8, color=cl)
+        pf = fr[(fr['w']==0)&(fr['mode']=='BH')].iloc[0]; pv = fr[(fr['w']==1)&(fr['mode']=='BH')].iloc[0]
+        ax.scatter([pf['mdd']*100],[pf['cagr']*100], s=120, color='green', zorder=5, label='순수 FAST')
+        ax.scatter([pv['mdd']*100],[pv['cagr']*100], s=120, color='black', zorder=5, label='순수 VR')
+        ax.set_xlabel('MDD (%)  ← 깊음    얕음 →'); ax.set_ylabel('CAGR (%)')
+        ax.set_title('Phase 0 블렌드 프론티어 (%s~%s)\nPhase 1은 이 선의 위-왼쪽에 앉아야 통합 정당' % (sd, ed))
+        ax.legend(loc='best'); ax.grid(True, alpha=0.3); plt.tight_layout()
+        plt.savefig('phase0_frontier.png', dpi=120, bbox_inches='tight'); print("  차트: phase0_frontier.png")
+        if in_nb:
+            try: plt.show()
+            except Exception: pass
+        plt.close()
+    except Exception as e:
+        print("  [차트 생략]", e)
+
+    print("\n" + "=" * 100)
+    print("  판정: Phase 1(gold 통합)의 V1/V2가 위 BH 프론티어의 '위-왼쪽'에 유의미하게")
+    print("        앉지 못하면 → 통합 무의미. 그냥 이 블렌드를 쓰는 게 더 단순·투명.")
+    print("  · 1차 기준은 BH(세금 정합 완전). Rebal은 리밸비용 뺀 낙관 기준선.")
+    print("=" * 100)
+    return fr
+
+if __name__ == "__main__":
+    _phase0_main()
