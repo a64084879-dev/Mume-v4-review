@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-[Phase 0 단일 실행 파일]  두 백테스터(FAST·VR)를 통째로 임베드해 블렌드 프론티어를 산출.
+[Phase 0.5 단일 실행 파일] 블렌드 프론티어 + 정밀 세금 경계 + 롤링 7년창  두 백테스터(FAST·VR)를 통째로 임베드해 블렌드 프론티어를 산출.
 이 파일 하나만 실행하면 됩니다. 다른 파일 불필요.
   · FAST 엔진 = 부스터B A(gold), 세후
   · VR 엔진   = 거치식 VR+KS(killswitch=on·B1=on·VOLTGT=off), 세후(FAST와 동일 잠재세 기준)
@@ -1334,7 +1334,7 @@ def _phase0_main():
     DB = _dbase()
 
     print("=" * 100)
-    print("  [Phase 0 · 단일파일] 두 엔진 직접 실행 → 블렌드 프론티어")
+    print("  [Phase 0.5 · 단일파일] 프론티어 + 세금경계 + 롤링강건성")
     print("=" * 100)
 
     # ---- FAST NAV (부스터B A(gold), fresh START, 세후) ----
@@ -1489,6 +1489,111 @@ def _phase0_main():
     print("        앉지 못하면 → 통합 무의미. 그냥 이 블렌드를 쓰는 게 더 단순·투명.")
     print("  · 1차 기준은 BH(세금 정합 완전). Rebal은 리밸비용 뺀 낙관 기준선.")
     print("=" * 100)
+
+    # ========================================================================
+    # [정밀 세금 경계] 별도 계좌 2개 — 리밸이 세금 내고도 BH보다 나은가
+    #   하한(무세금 Rebal) ↔ 상한(최악세금 Rebal, 원가=최초납입) 사이에 BH 위치 판정.
+    #   최악세금: 매년 승자계좌 매도분 실현이익에 22%(공제 2.5M KRW≈1724$/계좌).
+    # ========================================================================
+    INIT = 100000.0; EX = 1724.0; RATE = 0.22
+    def _ye(idx): return [(i < len(idx)-1 and idx[i].year != idx[i+1].year) for i in range(len(idx))]
+    def blend_rebal_taxed(dfn, w):
+        ra = dfn['VR'].pct_change().fillna(0).values; rb = dfn['FAST'].pct_change().fillna(0).values
+        idx = dfn.index; ye = _ye(idx)
+        av=w*INIT; ab=w*INIT; fv=(1-w)*INIT; fb=(1-w)*INIT
+        out = np.empty(len(idx)); taxc = 0.0
+        for i in range(len(idx)):
+            av*=(1+ra[i]); fv*=(1+rb[i]); total=av+fv; out[i]=total
+            if ye[i] and 0 < w < 1:
+                a_tgt = w*total
+                if av > a_tgt:
+                    sell=av-a_tgt; frac=sell/av if av>0 else 0.0
+                    gain=sell-ab*frac; tax=max(0.0,gain-EX)*RATE; taxc+=tax
+                    ab-=ab*frac; av-=sell; net=sell-tax; fv+=net; fb+=net
+                elif fv > (1-w)*total:
+                    sell=fv-(1-w)*total; frac=sell/fv if fv>0 else 0.0
+                    gain=sell-fb*frac; tax=max(0.0,gain-EX)*RATE; taxc+=tax
+                    fb-=fb*frac; fv-=sell; net=sell-tax; av+=net; ab+=net
+        return pd.Series(out, index=idx), taxc
+
+    print("\n" + "=" * 100)
+    print("  🔬 [정밀 세금 경계] 별도 계좌 2개 — 리밸이 세금 내고도 BH보다 나은가")
+    print("     하한=무세금Rebal(낙관) · 상한세금=최악(원가 최초납입, 보수적) · BH=리밸안함")
+    print("=" * 100)
+    print("  %10s | %20s | %20s | %20s" % ('w(VR)','BH(리밸X)','Rebal 무세금(하한)','Rebal 최악세금(보수)'))
+    print("  %10s | %9s %9s | %9s %9s | %9s %9s" % ('','CAGR','MDD','CAGR','MDD','CAGR','MDD'))
+    print("  " + "-"*76)
+    tax_summary = []
+    for w in W_GRID:
+        bh = blend_bh(df, w); rfree = blend_rebal(df, w)
+        rtax, taxc = blend_rebal_taxed(df, w)
+        s_bh = stats(bh); s_rf = stats(rfree); s_rt = stats(rtax/rtax.iloc[0])
+        tax_summary.append(dict(w=w, bh_cagr=s_bh['cagr'], bh_mdd=s_bh['mdd'],
+                                rf_cagr=s_rf['cagr'], rt_cagr=s_rt['cagr'], rt_mdd=s_rt['mdd'], taxc=taxc))
+        lbl = ("%.2f"%w)+(" (FAST)" if w==0 else " (VR)" if w==1 else "")
+        print("  %10s | %8.1f%% %8.1f%% | %8.1f%% %8.1f%% | %8.1f%% %8.1f%%" %
+              (lbl, s_bh['cagr']*100, s_bh['mdd']*100, s_rf['cagr']*100, s_bh['mdd']*100,
+               s_rt['cagr']*100, s_rt['mdd']*100))
+    print("  " + "-"*76)
+    # 판정: 최악세금 Rebal이 여전히 BH보다 위-왼쪽인 w가 있는가
+    verdict = "불명확(정밀 원가추적 필요)"
+    for t in tax_summary:
+        if 0 < t['w'] < 1:
+            better_cagr = t['rt_cagr'] > tax_summary[0]['bh_cagr']  # vs 순수 FAST BH
+            shallower = t['rt_mdd'] > tax_summary[-1]['bh_mdd']     # vs 순수 VR MDD
+    # 간단 판정 로직
+    rt_beats_bh = any((t['rt_cagr'] >= tax_summary[int(t['w']*0)]['bh_cagr']) for t in tax_summary if 0<t['w']<1)
+    print("  · 해석: 최악세금 Rebal(보수적 하한)이 BH 프론티어를 여전히 넘으면 → 리밸 채택 강건.")
+    print("         넘지 못하면 → BH(리밸 안 함)가 별도계좌 2개에선 사실상 정답.")
+    print("  · 진실은 [무세금 하한 ~ 최악세금 상한] 사이. 둘 다 BH보다 나으면 리밸, 둘 다 못하면 BH.")
+
+    # ========================================================================
+    # [롤링 7년창 강건성] 스윗스팟이 창마다 일관된가 (BH 기준, 실제 채택가능 전략)
+    #   엔진은 위에서 1회만 실행 → 여기선 NAV 슬라이싱만(가벼움).
+    # ========================================================================
+    def _rolling_windows(idx, years=7):
+        starts=[]; seen=set()
+        for ts in idx:
+            key=(ts.year, ts.month)
+            if key in seen: continue
+            seen.add(key)
+            end = ts + pd.DateOffset(years=years)
+            if end <= idx[-1]: starts.append((ts, end))
+        return starts
+    wins = _rolling_windows(df.index, 7)
+    print("\n" + "=" * 100)
+    print("  🔬 [롤링 7년창 강건성] BH 기준 — 스윗스팟이 창마다 일관된가 (%d개 창)" % len(wins))
+    print("     엔진 1회 실행 → NAV 슬라이싱. 각 창 재베이스 후 w별 BH 성과.")
+    print("=" * 100)
+    import collections
+    best_w=[]; rrows=[]
+    for s, e in wins:
+        sub = df.loc[(df.index>=s)&(df.index<=e)]
+        if len(sub) < 250: continue
+        sub = sub/sub.iloc[0]; shs={}
+        for w in W_GRID:
+            st = stats(blend_bh(sub, w)); rrows.append((w, st['cagr'], st['mdd'], st['sharpe'])); shs[w]=st['sharpe']
+        best_w.append(max(shs, key=shs.get))
+    hist = collections.Counter(best_w)
+    print("  [최적 w 히스토그램] 창별 Sharpe 최대 w — 특정 w에 몰리면 그게 강건한 스윗스팟")
+    for w in W_GRID:
+        print("    w=%.2f: %3d창  %s" % (w, hist.get(w,0), '█'*hist.get(w,0)))
+    rdf = pd.DataFrame(rrows, columns=['w','cagr','mdd','sharpe'])
+    print("\n  [w별 롤링 분포] 중앙값 (25%%~75%% 사분위)")
+    print("    %5s | %22s | %22s | %18s" % ('w','CAGR','MDD','Sharpe'))
+    for w in W_GRID:
+        g = rdf[rdf['w']==w]
+        print("    %5.2f | %6.1f%% (%5.1f~%5.1f) | %6.1f%% (%6.1f~%5.1f) | %5.2f (%4.2f~%4.2f)" %
+              (w, g['cagr'].median()*100, g['cagr'].quantile(.25)*100, g['cagr'].quantile(.75)*100,
+               g['mdd'].median()*100, g['mdd'].quantile(.25)*100, g['mdd'].quantile(.75)*100,
+               g['sharpe'].median(), g['sharpe'].quantile(.25), g['sharpe'].quantile(.75)))
+    print("  " + "-"*72)
+    print("  · 최적 w가 한두 값에 몰리면 → 그 비중이 기간에 강건한 스윗스팟.")
+    print("  · Sharpe 중앙값이 중간 w에서 최고면 → 다각화가 표본 전반에서 실재(1개 표본 착시 아님).")
+    pd.DataFrame(tax_summary).to_csv('phase05_tax_bounds.csv', index=False)
+    rdf.to_csv('phase05_rolling.csv', index=False)
+    print("\n  저장: phase05_tax_bounds.csv · phase05_rolling.csv")
+
     return fr
 
 if __name__ == "__main__":
