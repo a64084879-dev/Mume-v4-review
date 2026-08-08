@@ -1059,14 +1059,14 @@ def compute_signal(df, pos):
 
     # ── 킬스위치 (대피=매일 종가판정→다음날, 복귀=월말 종가→다음 거래일) ──
     ks_msg=[]; action_ks=None
-    below=g<gs
+    below=ndx<nsm   # ★KS-NDX(2026-08-08 승인): 탈출 판정 기준선 S&P500 → 나스닥100. 복귀는 현행 유지(비대칭)
     hi_pctl = (float(pc)>=B1_PCTL) if not pd.isna(pc) else False
     if ON(KILLSWITCH):
         if state=="INVESTED":
             exit_now=False; why=""
             if below:
-                if bub>=BUBBLE_LIMIT: exit_now=True; why="버블≥1.30 AND S&P 200일선 하회"; pos["evac_reason"]="bubble"
-                elif ON(B1_ON) and hi_pctl: exit_now=True; why=f"버블백분위≥{B1_PCTL:.0%} AND S&P 200일선 하회"; pos["evac_reason"]="b1"
+                if bub>=BUBBLE_LIMIT: exit_now=True; why="버블≥1.30 AND 나스닥100 200일선 하회"; pos["evac_reason"]="bubble"
+                elif ON(B1_ON) and hi_pctl: exit_now=True; why=f"버블백분위≥{B1_PCTL:.0%} AND 나스닥100 200일선 하회"; pos["evac_reason"]="b1"
             if exit_now:
                 action_ks="🔴 대피"
                 pos["evac_sig_date"]=str(today.date())   # ★소급복귀용(2026-07): 대피 판정일 저장 → /exit가 '보고일' 아닌 이 날짜로 last_recover_check 스탬프
@@ -1269,7 +1269,8 @@ def build_report(s, df):
     L.append(f"\n<b>[시장]</b>")
     L.append(f"TQQQ(실제가) {s['pr']:,.2f} | 버블 {s['bub']:.2f}"
              + (f" (백분위 {float(s['pc']):.0%})" if not pd.isna(s['pc']) else ""))
-    L.append(f"S&P {s['g']:,.0f} / 200일선 {s['gs']:,.0f} → {'아래' if s['g']<s['gs'] else '위'}")
+    L.append(f"나스닥100 {s['ndx']:,.0f} / 200일선 {s['nsm']:,.0f} → {'아래' if s['ndx']<s['nsm'] else '위'} (탈출 판정 지수)")
+    L.append(f"S&P {s['g']:,.0f} / 200일선 {s['gs']:,.0f} → {'아래' if s['g']<s['gs'] else '위'} (복귀 기준)")
     if ON(VOLTGT_ON) and not pd.isna(s['rv']):
         L.append(f"실현변동성 {float(s['rv']):.0%} → 목표노출 {s['scale']:.0%}")
     memo = "  ·오늘=월말 종가판정일(복귀여부 확인)" if s['is_month_end'] else ""
