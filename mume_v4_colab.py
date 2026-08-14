@@ -31,7 +31,8 @@ KELLY_CUT = 1.62                      # (참고 표기용 — 추2-4 판정 규�
 PCTL_HI   = 75.0                      # ★추2-2: 고지대 임계 — B1과 동일 사상, 새 숫자 신설 금지
 B1_WIN_D  = int(252 * 10)             # 직전 10년 롤링 창(B1 원형)
 B1_MINP_D = int(252 * 3)              # 최소 관측(B1 원형)
-FRED_CSV  = "https://fred.stlouisfed.org/graph/fredgraph.csv?id=BOGMBASE"   # ★추2-2: 공개 경로(API 키 불요)
+M0_FULL_PATHS = ["m0_full.csv", "/content/drive/MyDrive/m0_full.csv"]   # ★1순위: 정본 M0(네트워크 불요)
+FRED_CSV  = "https://fred.stlouisfed.org/graph/fredgraph.csv?id=BOGMBASE"   # 2순위: 추2-2 공개 경로(키 불요)
 M0_ANCHOR = (830.0, 840.0)            # ★추2-5 V6①: 2008-05 M0 단위 앵커(십억$)
 FETCH_START = "1985-10-01"
 TQQQ_REAL_START = "2010-02-11"
@@ -40,27 +41,106 @@ TQQQ_FULL_PATHS = ["tqqq_full.csv", "/content/drive/MyDrive/tqqq_full.csv"]  # �
 def _md5_file(p):
     return hashlib.md5(open(p, 'rb').read()).hexdigest()
 
+def _ensure_drive():
+    """Colab이면 드라이브 마운트 보장(이미 마운트면 무동작). 로컬이면 조용히 통과."""
+    if os.path.exists('/content/drive/MyDrive'):
+        return
+    try:
+        from google.colab import drive
+        drive.mount('/content/drive')
+    except Exception:
+        pass
+
 def fetch_m0():
-    """★추2-2: FRED BOGMBASE(월간) — fredgraph.csv 공개 경로, API 키 불요.
-       단위 정규화는 정본(load_m0_full/_norm)과 동일 사상: 백만$ 스케일이면 1000으로 나눠 십억$."""
+    """★추2-2: FRED BOGMBASE(월간). 주 경로 = fredgraph.csv 공개 경로(API 키 불요).
+       Colab에서 FRED 응답 지연이 잦아 짧은 타임아웃·재시도·대체 경로(DBnomics, 키 불요)·로컬 캐시를 둔다.
+       정본 load_m0_full과 동일 사상(여러 소스 시도 → 단위 정규화). 최종 단위 판정은 게이트 V6①."""
     import io, requests
-    r = requests.get(FRED_CSV, headers={'User-Agent': 'Mozilla/5.0'}, timeout=60)
-    r.raise_for_status()
-    df = pd.read_csv(io.StringIO(r.text))
-    d = pd.to_datetime(df[df.columns[0]], errors='coerce')
-    v = pd.to_numeric(df[df.columns[-1]], errors='coerce')
-    s = pd.Series(v.values, index=d).dropna().sort_index()
-    if len(s) and s.max() > 100000:
-        s = s / 1000.0                      # 백만$ → 십억$ (정본 _norm과 동일)
-    print(f"  · M0(BOGMBASE) 수신: {len(s)}개월 {s.index[0].date()}~{s.index[-1].date()} "
-          f"(fredgraph.csv 공개 경로)")
+    UA = {'User-Agent': 'Mozilla/5.0'}
+    CACHE = "m0_bogmbase_cache.csv"
+
+    def _norm(df):
+        d = pd.to_datetime(df[df.columns[0]], errors='coerce')
+        v = pd.to_numeric(df[df.columns[-1]], errors='coerce')
+        s = pd.Series(v.values, index=d).dropna().sort_index()
+        if len(s) and s.max() > 100000:
+            s = s / 1000.0                      # 백만$ → 십억$ (정본 _norm과 동일)
+        return s
+
+    def _ok(s):
+        if s is None or len(s) == 0:
+            return False
+        seg = s[(s.index >= '2008-05-01') & (s.index <= '2008-05-31')]
+        return len(seg) > 0 and M0_ANCHOR[0] <= float(seg.iloc[0]) <= M0_ANCHOR[1]
+
+    _ensure_drive()
+    for _p in M0_FULL_PATHS:                    # 0) ★정본 m0_full.csv 우선 — 네트워크 0회(tqqq_full.csv와 동일 사상)
+        if os.path.exists(_p):
+            try:
+                s = _norm(pd.read_csv(_p))
+                if _ok(s):
+                    print(f"  · M0 정본 파일 사용: {_p} ({len(s)}개월 ~{s.index[-1].date()}, "
+                          f"md5={_md5_file(_p)[:8]}) — 정본 데이터 재사용, 무수정·네트워크 불요")
+                    return s
+            except Exception:
+                pass
+
+    if os.path.exists(CACHE):                   # 1) 같은 세션 재실행은 캐시로 즉시
+        try:
+            s = _norm(pd.read_csv(CACHE))
+            if _ok(s):
+                print(f"  · M0 로컬 캐시 사용: {CACHE} ({len(s)}개월 ~{s.index[-1].date()})")
+                return s
+        except Exception:
+            pass
+
+    s = None; tried = []
+    for _ in range(3):                          # 1) 주 경로: fredgraph.csv(사양 지정, 키 불요)
+        try:
+            r = requests.get(FRED_CSV, headers=UA, timeout=(5, 20))
+            r.raise_for_status()
+            s = _norm(pd.read_csv(io.StringIO(r.text)))
+            if _ok(s):
+                print("  · M0 소스: fredgraph.csv(공개 경로)")
+                break
+            tried.append("fredgraph 앵커 불합격")
+        except Exception as e:
+            tried.append(f"fredgraph {type(e).__name__}")
+            s = None
+    if not _ok(s):                              # 2) 대체: DBnomics(키 불요, FRED 미러)
+        try:
+            r = requests.get("https://api.db.nomics.world/v22/series/FRED/BOGMBASE?observations=1",
+                             headers=UA, timeout=(5, 25))
+            r.raise_for_status()
+            d = r.json()['series']['docs'][0]
+            s = _norm(pd.DataFrame({'d': d['period'], 'v': d['value']}))
+            if _ok(s):
+                print("  · M0 소스: DBnomics(FRED 미러) — 주 경로 지연으로 대체 사용")
+        except Exception as e:
+            tried.append(f"dbnomics {type(e).__name__}")
+    if not _ok(s):
+        raise RuntimeError("M0 확보 실패 — 드라이브에 m0_full.csv(정본)가 있으면 네트워크 없이 즉시 해결됩니다. "
+                           "시도: " + " / ".join(tried))
+    try:
+        s.rename('BOGMBASE').rename_axis('DATE').to_csv(CACHE)
+    except Exception:
+        pass
+    print(f"  · M0(BOGMBASE): {len(s)}개월 {s.index[0].date()}~{s.index[-1].date()}")
     return s
 
 def _fetch_close(tk, start):
-    import yfinance as yf
-    df = yf.download(tk, start=start, progress=False, auto_adjust=True)
+    import yfinance as yf, time
+    df = None
+    for _i in range(3):                        # 간헐 지연 대비 재시도
+        try:
+            df = yf.download(tk, start=start, progress=False, auto_adjust=True)
+            if df is not None and len(df) > 0:
+                break
+        except Exception:
+            df = None
+        time.sleep(2)
     if df is None or len(df) == 0:
-        raise RuntimeError(f"{tk} 다운로드 실패")
+        raise RuntimeError(f"{tk} 다운로드 실패 — 셀 재실행 권장")
     s = df['Close']
     s = s.squeeze() if hasattr(s, 'squeeze') else s
     s.index = pd.to_datetime(s.index).tz_localize(None)
@@ -69,6 +149,7 @@ def _fetch_close(tk, start):
 
 def load_tqqq_full():
     """정본 tqqq_full.csv 로드(읽기 전용). 없으면 드라이브 마운트 후 재시도."""
+    _ensure_drive()
     for p in TQQQ_FULL_PATHS:
         if os.path.exists(p):
             df = pd.read_csv(p)
@@ -109,7 +190,7 @@ def main():
     try:
         self_md5 = hashlib.md5(open(__file__, 'rb').read()).hexdigest()
     except Exception:
-        self_md5 = "(셀 붙여넣기 실행 — %run으로 실행하면 파일 md5 출력)"
+        self_md5 = "(셀 붙여넣기 실행 — 스크립트 md5는 칠판 raw 파일로 대조)"
     print(f"  · 스크립트 md5: {self_md5}")
     print("  · f_frict 교정값: 해당 없음 — 추록1로 신규 합성(R1-3) 폐기, 정본 tqqq_full.csv 재사용")
 
