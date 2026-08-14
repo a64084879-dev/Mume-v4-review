@@ -82,9 +82,16 @@ warnings.filterwarnings("ignore")        # FutureWarning 스팸 제거 (계산�
 
 # ══════════════ [1. 파라미터] ══════════════
 FETCH_START = "1985-10-01"
-START_DATES = ["1986-08-11", "1994-01-02", "1998-01-02", "2000-01-02", "2010-02-11",
+START_DATES = ["2000-01-02","2002-01-02", "2004-01-02", "2006-01-02", "2008-01-02", "2010-02-11",
                "2013-01-02", "2016-01-02", "2019-01-02", "2022-01-02", "2024-01-02"]
-END_DATE    = "2026-07-10"           # None=데이터끝. 책재현="2020-12-31"
+END_DATE    = "2026-07-10"           # 데이터 다운로드 상한(고정)
+# ★종료일 스윗(2026-08-08 은박사님 지시): 아래 리스트만 고치면 자유롭게 변경 가능.
+END_DATES = ["2018-12-31",  # 금 겨울 끝·VR 전성기 종료 시점
+             "2020-12-31",  # 코로나 회복 후
+             "2021-12-31",  # 직전 고점(하락 직전에 끝냈다면)
+             "2022-12-30",  # 하락 바닥권(최악에 끝냈다면)
+             "2024-12-31",  # 금 급등 중
+             "2026-07-10"]  # 현재(기존 공식표 재현 = 회귀 검증)
 
 # ★★ v2 핵심 스위치 ★★
 #   1 = 봇 정합 (전일 종가 신호 → 당일 종가 집행)   ← 기본·실전 재현
@@ -1160,48 +1167,47 @@ def summary(df):
 
 
 # ══════════════ [7. 실행] ══════════════
+def _table_ends(df, sd):
+    """★시작일 고정 · 행=종료일. 열 구성은 기존 공식표와 동일(run_vr 호출부 재사용)."""
+    cols = [("종료일", 13, "<"), ("년수", 7, ">"), ("원금", 10, ">"),
+            ("VR+KS세후", 15, ">"), ("CAGR", 8, ">"), ("MDD", 8, ">"), ("샤프", 7, ">"),
+            ("VR단독세후", 15, ">"), ("CAGR", 8, ">"), ("MDD", 8, ">"), ("샤프", 7, ">"),
+            ("TQQQ보유", 13, ">"), ("CAGR", 8, ">"), ("MDD", 9, ">"),
+            ("QQQ보유", 12, ">"), ("대피/복귀", 10, ">")]
+    LN = sum(w for _, w, _a in cols)
+    _pc = lambda x: f"{x*100:.1f}%" if x == x else "  —"
+    _sh = lambda x: f"{x:.2f}" if x == x else "  —"
+    print("\n" + "★" * LN)
+    print(f"  ★★★ 시작일 {sd} — 종료일별 (킴스위치=비대칭 확정형, 거치식 {HOLD_CAP:,.0f} 세후) ★★★")
+    print("★" * LN)
+    print("".join(_cell(h, w, a) for h, w, a in cols))
+    print("-" * LN)
+    for ed in END_DATES:
+        if ed <= sd:
+            continue
+        globals()["END_DATE"] = ed
+        sub = df[(df.index >= sd) & (df.index <= ed)]
+        if len(sub) < 300:
+            print(_cell(ed, cols[0][1], "<") + "  (기간 부족 — 건너뜀)"); continue
+        rk = run_vr(sub, HOLD_CAP, HOLD_POOL, HOLD_G, HOLD_LIMIT, 0.0, 0.0, killswitch=ON(KILLSWITCH))
+        rn = run_vr(sub, HOLD_CAP, HOLD_POOL, HOLD_G, HOLD_LIMIT, 0.0, 0.0, killswitch=False)
+        ht = run_hold_bench(sub["TQQQ"], HOLD_CAP, 0.0, 0.0, full=True)
+        hq = run_hold_bench(sub["QQQ"], HOLD_CAP, 0.0, 0.0)
+        row = [ed, f"{rk['yrs']:.1f}", f"{rk['cum']:,.0f}",
+               _money(rk['aftertax']), _pc(rk['cagr']), _pc(rk['mdd']), _sh(rk['sharpe']),
+               _money(rn['aftertax']), _pc(rn['cagr']), _pc(rn['mdd']), _sh(rn['sharpe']),
+               _money(ht['aftertax']), _pc(ht['cagr']), _pc(ht['mdd']),
+               _money(hq), f"{rk['n_exit']}/{rk['n_rec']}"]
+        print("".join(_cell(v, w, a) for v, (_, w, a) in zip(row, cols)))
+    print("-" * LN)
+
 if __name__ == "__main__":
-    db = _drive_base()
-    print("=" * 122)
-    print("  라오어 VR v3 — 거치식·적립식·인출식 (+킬스위치/B1/VOLTGT) · 신호·집행 분리 · ★연차 실현과세")
-    print("=" * 122)
-    df = build_data(db)
-    print(f"  · 시계열: {df.index[0].date()} ~ {df.index[-1].date()} ({len(df)}행) "
-          f"| 버블 최신 {df['BUB'].iloc[-1]:.2f}")
-    print(f"  · SIGNAL_LAG={SIGNAL_LAG} "
-          f"({'봇 정합 — 전일 종가 신호 → 당일 종가 집행' if SIGNAL_LAG else 'v1 재현 — 당일 신호·당일 집행'})")
-
-    # ★★ 결론부터 — 실데이터(2010~)만 ★★
-    summary(df)
-
-    if ON(RUN_HOLD):
-        _table(df, f"거치식VR {HOLD_CAP:,.0f} (Pool{HOLD_POOL*100:.0f}%, G={HOLD_G}, "
-                   f"한도{HOLD_LIMIT*100:.0f}%, 세후)",
-               HOLD_CAP, HOLD_POOL, HOLD_G, HOLD_LIMIT, 0.0, 0.0)
-    if ON(RUN_DCA):
-        _table(df, f"적립식VR (초기{DCA_INIT:.0f}, 격주적립{DCA_MONTHLY/2:.0f}, "
-                   f"Pool{DCA_POOL*100:.0f}%, G={DCA_G}, 한도{DCA_LIMIT*100:.0f}%, 세후)",
-               DCA_INIT, DCA_POOL, DCA_G, DCA_LIMIT, DCA_MONTHLY / 2, 0.0)
-    if ON(RUN_WD):
-        _table(df, f"인출식VR {WD_CAP:,.0f} (격주인출{WD_MONTHLY/2:.0f}, Pool{WD_POOL*100:.0f}%, "
-                   f"G={WD_G}, 한도{WD_LIMIT*100:.0f}%, 세후·성과=NAV+인출누계)",
-               WD_CAP, WD_POOL, WD_G, WD_LIMIT, 0.0, WD_MONTHLY / 2)
-
-    print("\n" + "=" * 122)
-    print("  · VR단독 = 킬스위치 OFF. 대피 0회면 VR+KS = VR단독. CAGR = VR+KS 세후.")
-    print("  · V_next = V + pool/G + (적립−인출). 거치 G10/P10%/한도50 · 적립 G10/P0%/한도75 "
-          "· 인출 G20/P20%/한도25")
-    print("  · ★신호·집행 분리: 대피·복귀·VOLTGT는 전일 종가 신호로 당일 종가에 집행(봇=익일 LOC).")
-    print("    밴드 매매(사다리)는 지정가 사전게시 → 당일 체결이 정당(지연 없음).")
-    print("  · ★v3 세금: 매도 실현익 → 12/31 정산(부채 계상) → 다음해 6월 첫 거래일 부록A 방식 납부.")
-    print(f"    공제 연 ₩{TAX_DEDUCTION_KRW:,.0f}(≈${TAX_DEDUCTION:,.0f} @₩{FX_KRWUSD:,.0f}/$, "
-          f"이 계좌 전액사용·이월 없음·마지막해 1회) · 이월결손 차단 · 수수료 편도 {(FEE_RATE+SLIP)*100:.2f}%.")
-    print("    v2 재현 = TAX_MODE='maturity' + TAX_DEDUCTION=250.0 + FEE_RATE=0.0"
-          " + SHARPE_RF='irx' + SHARPE_NUM='arith'  (5개 동시)")
-    print("=" * 122)
-
-    if ON(CHART_ON):
-        try:
-            make_chart(df, CHART_START, mode=CHART_MODE)
-        except Exception as e:
-            print(f"  · 차트 생략({str(e)[:70]})")
+    df = build_data(db="")
+    print("=" * 118)
+    print("  ★종료일 스윗 v2 — 시작일 바깥 루프 · 종료일 안쪽 (2026-08-08 은박사님 지시 순서)")
+    print("  · 마지막 열(2026-07-10 행)이 기존 공식표의 같은 시작일 행과 일치하면 회귀 검증 통과")
+    print("=" * 118)
+    for sd in START_DATES:
+        _table_ends(df, sd)
+    globals()["END_DATE"] = "2026-07-10"
+    print("\n  · 파산(빚 X) = 만기 청산 후에도 남는 미납 세금부채. CAGR '—' = 세후액 ≤ 0.")
