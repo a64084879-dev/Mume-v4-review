@@ -1246,7 +1246,7 @@ def run_r4(D, win, x_pct, m_monthly, fast_init=FAST_INIT, vr_init=VR_INIT,
     # ── 통합 상태 ──
     stage = 1; stage2_date = None; scale_path = []
     nav_path = np.empty(len(dates)); cf_day = np.zeros(len(dates))
-    year_rows = []; tax_total = 0.0
+    year_rows = []; tax_total = 0.0; tax_log = []   # ★v2: (연도, 합산 실현손익, 공제 후, 세액)
     prev_month = None
     narr = []
 
@@ -1457,7 +1457,9 @@ def run_r4(D, win, x_pct, m_monthly, fast_init=FAST_INIT, vr_init=VR_INIT,
             scale_path.append((cd, (f_v * FAST_TICK + v_v * VR_TICK) / tot if tot > 0 else np.nan))
         if is_year_end:
             uni['realized'] += vled.realized; vled.realized = 0.0    # VR 기록부 흡수(Q2)
-            uni['liab'] += max(0.0, uni['realized'] - TAX_EXEMPTION) * TAX_RATE_EQUITY
+            _t = max(0.0, uni['realized'] - TAX_EXEMPTION) * TAX_RATE_EQUITY
+            tax_log.append((cd.year, uni['realized'], max(0.0, uni['realized'] - TAX_EXEMPTION), _t))   # ★v2
+            uni['liab'] += _t
             uni['realized'] = 0.0
             if fast_init > 0: f_annual_pending = True                # FAST 연 리밸(정본 타이밍)
 
@@ -1490,7 +1492,7 @@ def run_r4(D, win, x_pct, m_monthly, fast_init=FAST_INIT, vr_init=VR_INIT,
     # VR 사이클 V 갱신을 별도 패스로(정본: 사이클 마지막 날 종가)
     return dict(nav=pd.Series(nav_path, index=dates), cf=pd.Series(cf_day, index=dates),
                 n_exit=n_exit, evac_days=evac_days, v_nexit=v_nexit, stage2=stage2_date,
-                scale_path=scale_path, tax_total=tax_total, narr=narr)
+                scale_path=scale_path, tax_total=tax_total, narr=narr, tax_log=tax_log)
 
 # ═══ [메인: 창 열거·게이트·산출물 — 사양 v1.1 ⑥⑦⑧] ═══
 def _win_list(idx):
@@ -1528,6 +1530,9 @@ def main():
         self_md5 = "(셀 붙여넣기 실행 — 스크립트 md5는 칠판 raw로 대조)"
     print(f"  · 스크립트 md5: {self_md5}")
     print(f"  · MONTHLY_M = {MONTHLY_M:,.0f} / EXTRA_REPAY_PCT = {EXTRA_REPAY_PCT}")
+    if MONTHLY_M > 0:
+        print("  · CAGR은 총투입(시작+적립 누계) 대비 단순 연율 — 적립 시점 미가중이라 실제 자금가중")
+        print("    수익률보다 보수적으로 표기됨.")
     if MONTHLY_M <= 0:
         print("  · 적립 없음 — 현재 자산(FAST 20만+VR 0.73만)만으로 40년 주행. 방석 미형성·2단계 미전환이")
         print("    정상이며 결함 아님. (이 경우 시나리오 X=0과 X=조절값은 동일 결과가 되는 것이 정상)")
@@ -1574,7 +1579,7 @@ def main():
     print("\n" + "-" * 100)
     print(f"  [V3] 창 무결({len(wins)}창 = R1 24 + E1 16 + E2 12) × 시나리오 {len(scenarios)}")
     rows = []
-    narr_store = {}
+    narr_store = {}; v8c_res = None
     for mode, y, win in wins:
         sub = D.loc[win]
         assert not sub[['TQQQ', 'gold', 'GSPC_RAW', 'NDX_RAW', 'IRXD', 'Bubble_Value']].isna().any().any(), f"{mode}/{y} 결측"
@@ -1612,6 +1617,8 @@ def main():
                          "위기일최악%": round(worst_cr, 3) if worst_cr == worst_cr else ""})
             if mode == "R1" and y in (2000, 2010) and sname == scenarios[1][0]:
                 narr_store[y] = (res, at, win)
+            if mode == "R1" and y == 2000 and sname == "X0":
+                v8c_res = res                                   # ★v2: V8(c) 스팟 검산용(2000·X0)
         r0 = rows[-2] if len(rows) >= 2 else rows[-1]
         print(f"    [{mode}] {y}: {win[0].date()}~{win[-1].date()} {yrs:5.2f}년 {len(win):>5,}일 {note:4s}| "
               f"KS {r0['KS발동']:>2} 대피 {r0['대피일수']:>4}일 | [V4] BOXX {b_cagr*100:5.2f}% vs IRX {mean_irx:5.2f}% "
@@ -1630,10 +1637,19 @@ def main():
         print(f"      KS 발동 {res['n_exit']}회 · 대피 {res['evac_days']}일 · 세금 누계 ${res['tax_total']:,.0f} · "
               f"방석완성 {str(res['stage2'].date()) if res['stage2'] else '미도달'}")
 
-    # ── V8(c) 세금 바구니 스팟 3건(수기 검산용 — 대표 창 X0) ──
-    print("\n  [V8] (c) 세금 바구니 스팟(수기 검산용): 공제 $1,785.71 연 1회·22% — summary와 로그로 대조")
-    print("      (각 연도 세액 = max(0, FAST+VR+BOXX 실현손익 합산 − 공제) × 0.22 — 3개 연도를 골라")
-    print("       서사 표의 세금 누계 증분과 대조하십시오. 통합층 산식은 정본 year_end와 동일 문구.)")
+    # ── V8(c) 세금 바구니 스팟 3건(★v2 실질화 — 대표 창 R1/2000·시나리오 X0) ──
+    print("\n  [V8] (c) 세금 바구니 스팟 검산 3건 — R1/2000 창·시나리오 X0, 공제 초과 연도에서 선별:")
+    print("      검산식: 세액 ≟ max(0, 합산 실현손익 − 1,785.71) × 0.22")
+    if v8c_res is not None:
+        _tl = [r for r in v8c_res['tax_log'] if r[1] > TAX_EXEMPTION]
+        pick = ([_tl[0], _tl[len(_tl) // 2], _tl[-1]] if len(_tl) >= 3 else _tl)
+        print(f"      {'연도':>6} | {'합산 실현손익$':>16} | {'공제 후$':>14} | {'세액$':>12}")
+        for yy, rz, af, tx in pick:
+            print(f"      {yy:>6} | {rz:>16,.2f} | {af:>14,.2f} | {tx:>12,.2f}")
+        if not _tl:
+            print("      (공제 초과 연도 없음 — 해당 창 실현손익이 전부 공제 이하)")
+    else:
+        print("      (R1/2000 창 미실행 — 창 목록 축소 실행)")
 
     # ── 눈금 경로 요약 ──
     print("\n  [눈금] 1.83→1.44 경로: 분기별 눈금은 scale_path에 기록 — 대표 창 마지막 8개 분기:")
