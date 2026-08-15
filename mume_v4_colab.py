@@ -10,6 +10,8 @@
 #   Q2 80:20 복원은 사양 R5-1이 허가한 유일한 신규 접점(기존 부품 재사용, ★R5 신규 접점 주석 표시) /
 #   Q3 대피 중에도 12/31 무조건 복원 / Q4 복원 실현손익은 B 통합 바구니 산입(KRX금 비과세) /
 #   Q5 창당 차트 1장에 A/B/C 3선 + 낙폭 3선.
+#   · 정오(감사역 2026-08-15): 사양 V9(a) 원문('방석0 vs C')은 동일 호출의 동어반복이라 실행 검증력 0 —
+#     취지(복원 블록 중립)는 `cush_w>0` 게이트로 정적 보장, 실행 게이트는 C↔정본(W_A) 대조로 대체.
 #   · 관찰 전용 — 60:40 스윕 봉인·방석 확정 불변. 재론은 연말 재심 절차로만(각주 인쇄).
 #   · A팔 가중 = 정본 99행 W_B 원문 이식. QQQDD 없음. 창별 튜닝 없음. 정본·배포본 무접촉.
 #   · 실행: Colab %run kelly17_research_r5.py (드라이브 자동 연결, 한글 그래프 출력)
@@ -1423,22 +1425,25 @@ def main():
 
     # ── V9 정합(대표 3창) ──
     print("\n" + "-" * 100)
-    print(f"  [V9] 정합 — (a) B에서 방석 0 → C와 일치 / (b) A ↔ 정본 run_simulation(W_B) 직접 실행")
+    print(f"  [V9] 정합 — (a) C(이식본) ↔ 정본 run_simulation(W_A) / (b) A(이식본) ↔ 정본 run_simulation(W_B)")
+    print("       ※ 사양 V9(a) 원문('방석0 vs C')은 동일 호출의 동어반복이라 실행 검증력 0 —")
+    print("         복원 블록 중립은 `cush_w>0` 게이트로 정적 보장, 실행 게이트는 위 대조로 대체(정오).")
     print(f"       허용 ±{V9_TOL}%p(R4 실측 최대 +0.395%p 감안), {V9_REPORT}%p 초과 시 통과라도 원인 보고")
     for mode, y, win in [w for w in wins if w[0] == "R1" and w[1] in (1994, 2000, 2005)]:
         yrs = (win[-1] - win[0]).days / 365.25
         cagr = lambda v: (v / R5_INIT) ** (1 / yrs) - 1
-        rb0 = run_arm(D, win, W_A, 0.0)                     # B 구조에서 방석 0
-        rc = run_arm(D, win, W_A, 0.0)
-        da = (cagr(float(rb0['nav'].iloc[-1])) - cagr(float(rc['nav'].iloc[-1]))) * 100
-        ra = run_arm(D, win, W_B, 0.0)
+        rc = run_arm(D, win, W_A, 0.0)                      # C = 이식본 FAST 60:40 단독
+        nav_c, _ = run_simulation(D.loc[win], R5_INIT, W_A, method='fast_recover')
+        da = (cagr(float(rc['nav'].iloc[-1])) - cagr(float(nav_c.iloc[-1]))) * 100
+        ra = run_arm(D, win, W_B, 0.0)                      # A = 이식본 FAST 50:50 단독
         nav_o, _ = run_simulation(D.loc[win], R5_INIT, W_B, method='fast_recover')
         db = (cagr(float(ra['nav'].iloc[-1])) - cagr(float(nav_o.iloc[-1]))) * 100
         okA, okB = abs(da) <= V9_TOL, abs(db) <= V9_TOL
-        print(f"    [{y}] (a) 방석0 vs C: 차 {da:+.3f}%p {'PASS' if okA else '★FAIL'} | "
-              f"(b) A vs 정본: {cagr(float(ra['nav'].iloc[-1]))*100:6.2f}% vs {cagr(float(nav_o.iloc[-1]))*100:6.2f}% "
+        print(f"    [{y}] (a) C(이식본) vs 정본(W_A): {cagr(float(rc['nav'].iloc[-1]))*100:6.2f}% vs "
+              f"{cagr(float(nav_c.iloc[-1]))*100:6.2f}% → 차 {da:+.3f}%p {'PASS' if okA else '★FAIL'} | "
+              f"(b) A vs 정본(W_B): {cagr(float(ra['nav'].iloc[-1]))*100:6.2f}% vs {cagr(float(nav_o.iloc[-1]))*100:6.2f}% "
               f"→ 차 {db:+.3f}%p {'PASS' if okB else '★FAIL'}")
-        if abs(db) > V9_REPORT:
+        if abs(da) > V9_REPORT or abs(db) > V9_REPORT:
             print(f"        · 보고: 오차 {V9_REPORT}%p 초과 — 원인 = 만기 청산·납부 경로의 통합화(R4 V8 기실측 동일 사유)")
         assert okA and okB, f"V9 실패: {y}"
 
@@ -1539,4 +1544,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-  
