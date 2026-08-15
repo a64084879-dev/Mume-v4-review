@@ -21,6 +21,8 @@ MONTHLY_M = 0
 # ★ 2단계 추가상환 비율(%). 여유자금 중 이 비율을 대출 추가상환, 나머지를 VR 53:방석 47로.
 #   은박사님이 이 숫자만 바꿔 재실행 — 예: 0, 30, 50
 EXTRA_REPAY_PCT = 30
+# ★ on이면 정본 비교표 모드, off면 표준 52창 주행
+COMPARE_MODE = "on"
 
 import os, hashlib
 import numpy as np
@@ -75,6 +77,13 @@ M0_FULL_PATHS = ["m0_full.csv", "/content/drive/MyDrive/m0_full.csv"]
 FRED_CSV = "https://fred.stlouisfed.org/graph/fredgraph.csv?id=BOGMBASE"
 M0_ANCHOR = (830.0, 840.0)
 CRISIS_DD = -0.05
+# ── 비교 모드 창 세트(v3): VR 정본(823903a7 계열 종료일 다각화판)·FAST 정본(150b88ef)에서 그대로 이식 ──
+VR_START_DATES = ["2000-01-02", "2002-01-02", "2004-01-02", "2006-01-02", "2008-01-02", "2010-02-11",
+                  "2013-01-02", "2016-01-02", "2019-01-02", "2022-01-02", "2024-01-02"]   # VR 정본 원문
+FAST_START_DATES = ["1986-08-11", "1994-01-02", "1998-01-02", "2000-01-02", "2010-02-11",
+                    "2013-01-02", "2016-01-02", "2019-01-02", "2022-01-02", "2024-01-02"]  # FAST 정본 93행
+CMP_END_DATES = ["2018-12-31", "2020-12-31", "2021-12-31", "2022-12-30", "2024-12-31", "2026-07-10"]  # VR 정본 원문
+FAST_STD_INIT = 100_000.0             # FAST 정본 관행 초기값(INITIAL_CAPITAL, 96행)
 FETCH_START_DATE = FETCH_START
 END_DATE = pd.Timestamp.today().strftime('%Y-%m-%d')
 
@@ -1134,6 +1143,13 @@ def build_master():
     idx = idx[idx <= last]
     D = pd.DataFrame(index=idx)
     D['TQQQ'] = lev.reindex(idx).ffill()
+    try:                                                     # QQQ = 실 QQQ(1999-03~) + 이전 ^NDX 후방 스케일 접합
+        qqq = _fetch_close('QQQ', "1999-01-01")
+        bq = qqq.index[0]
+        qq = pd.concat([ndx[ndx.index < bq] * (qqq.loc[bq] / ndx.loc[bq]), qqq]).sort_index()
+        D['QQQ'] = qq[~qq.index.duplicated()].reindex(idx).ffill()
+    except Exception:
+        D['QQQ'] = np.nan
     D['TQQQ_OPEN'] = D['TQQQ']                     # 정본 tqqq_full의 OPEN은 접합 전 구간용 — 통합은 종가 체결로 통일(각주)
     D['gold'] = gold.reindex(idx).ffill()
     D['NDX'] = D['NDX_RAW'] = ndx.reindex(idx).ffill()
@@ -1520,6 +1536,126 @@ def _annual_table(res):
         prev = ye[y]
     return rows
 
+def main_compare(D, self_md5):
+    """★v3 비교 모드(사양 v1.1 불변·판정 로직 무변경): 정본 창 세트(시작 합집합 14 × 종료 6)에서
+       R4통합 | FAST단독(정본 run_simulation) | VR단독(정본 run_vr) | TQQQ보유 | QQQ보유 병렬 비교."""
+    print("  · [비교 모드] 창 세트 = VR 정본 시작 11 + FAST 정본 시작 10의 합집합(14) × 종료 6(정본 원문)")
+    print("  · 각주(필수): 비교표는 관찰 전용 — 배합·파라미터 판단 근거로 사용 금지(칸 고르기 금지).")
+    print("    단독 열은 방석·적립·통합과세가 없는 각 정본 원형의 성적.")
+    print(f"  · 각주: 단독 열 초기값은 각 정본 관행 그대로(FAST ${FAST_STD_INIT:,.0f}·VR ${HOLD_CAP:,.0f}) —")
+    print("    금액이 달라도 CAGR·MDD 비교는 유효. R4통합 배수 = 최종세후 ÷ 총투입(시작 $207,300+적립 누계).")
+    print("  · 각주: V8은 본 표 자체가 전 창 확장판이므로 별도 생략(v2에서 대표 3창 ±0.05%p 이내 기통과).")
+    starts = sorted(set(VR_START_DATES) | set(FAST_START_DATES))
+    src_of = {s: ("공통" if s in VR_START_DATES and s in FAST_START_DATES
+                  else ("VR" if s in VR_START_DATES else "FAST")) for s in starts}
+    rows = []
+    n_win = 0
+    print("\n" + "-" * 118)
+    for sd in starts:
+        sd_t = pd.Timestamp(sd)
+        if sd_t < D.index[0]: continue
+        for ed in CMP_END_DATES:
+            ed_t = pd.Timestamp(ed)
+            if ed_t <= sd_t or ed_t > D.index[-1]: continue
+            win = D.index[(D.index >= sd_t) & (D.index <= ed_t)]
+            if len(win) < 260: continue
+            sub = D.loc[win]
+            assert not sub[['TQQQ', 'gold', 'GSPC_RAW', 'NDX_RAW', 'IRXD', 'Bubble_Value']].isna().any().any(), f"{sd}~{ed} 결측"
+            n_win += 1
+            yrs = (win[-1] - win[0]).days / 365.25
+            bx = sub['BOXX']; b_cagr = (bx.iloc[-1] / bx.iloc[0]) ** (1 / yrs) - 1
+            v4 = abs(b_cagr * 100 - float(sub['IRX'].mean()))
+            assert v4 <= 0.3, f"V4 실패 {sd}~{ed}: {v4:.2f}%p"
+            # R4통합(실제 시작 상태 + M 적립 + X=EXTRA_REPAY_PCT)
+            r4 = run_r4(D, win, float(EXTRA_REPAY_PCT), float(MONTHLY_M))
+            cum_in = FAST_INIT + VR_INIT + float(r4['cf'].sum())
+            a4 = float(r4['nav'].iloc[-1])
+            c4 = (a4 / cum_in) ** (1 / yrs) - 1 if a4 > 0 else float('nan')
+            m4 = float((r4['nav'] / r4['nav'].cummax() - 1).min()) * 100
+            x4 = a4 / cum_in
+            # FAST단독(정본 관행 $100,000)
+            nav_f, _ = run_simulation(sub, FAST_STD_INIT, W_A, method='fast_recover')
+            af = float(nav_f.iloc[-1])
+            cf_ = (af / FAST_STD_INIT) ** (1 / yrs) - 1 if af > 0 else float('nan')
+            mf = float((nav_f / nav_f.cummax() - 1).min()) * 100
+            xf = af / FAST_STD_INIT
+            # VR단독(정본 관행 $100,000·Pool 10%)
+            vr = run_vr(sub, HOLD_CAP, HOLD_POOL, HOLD_G, HOLD_LIMIT, killswitch=True)
+            cv = vr['cagr'] * 100 if vr['cagr'] == vr['cagr'] else float('nan')
+            mv = vr['mdd'] * 100 if vr['mdd'] == vr['mdd'] else float('nan')
+            xv = (vr['aftertax'] / vr['cum']) if vr['cum'] else float('nan')
+            # 단순보유(TQQQ·QQQ — 가격 경로, 비용 0)
+            def _hold(col):
+                s = sub[col]
+                if s.isna().any(): return (float('nan'),) * 3
+                c = (s.iloc[-1] / s.iloc[0]) ** (1 / yrs) - 1
+                m = float((s / s.cummax() - 1).min()) * 100
+                return c * 100, m, s.iloc[-1] / s.iloc[0]
+            ct, mt, xt = _hold('TQQQ'); cq, mq, xq = _hold('QQQ')
+            print(f"  [{src_of[sd]:>2}] {sd}~{ed} {yrs:5.2f}년 | "
+                  f"R4통합 {c4*100:6.2f}%/{m4:6.1f}%/x{x4:6.2f} | "
+                  f"FAST {cf_*100:6.2f}%/{mf:6.1f}%/x{xf:6.2f} | "
+                  f"VR {cv:6.2f}%/{mv:6.1f}%/x{xv:6.2f} | "
+                  f"TQQQ {ct:6.2f}%/{mt:6.1f}%/x{xt:6.2f} | QQQ {cq:6.2f}%/{mq:6.1f}%/x{xq:6.2f}")
+            rows.append({"출처": src_of[sd], "시작일": sd, "종료일": ed, "길이년": round(yrs, 2),
+                         "R4_CAGR%": round(c4 * 100, 3) if c4 == c4 else "", "R4_MDD%": round(m4, 2),
+                         "R4_배수": round(x4, 3), "R4_적립누계$": round(float(r4['cf'].sum()), 0),
+                         "R4_KS": r4['n_exit'], "R4_대피일수": r4['evac_days'],
+                         "FAST_CAGR%": round(cf_ * 100, 3) if cf_ == cf_ else "", "FAST_MDD%": round(mf, 2),
+                         "FAST_배수": round(xf, 3),
+                         "VR_CAGR%": round(cv, 3) if cv == cv else "", "VR_MDD%": round(mv, 2),
+                         "VR_배수": round(xv, 3) if xv == xv else "",
+                         "TQQQ_CAGR%": round(ct, 3) if ct == ct else "", "TQQQ_MDD%": round(mt, 2) if mt == mt else "",
+                         "TQQQ_배수": round(xt, 3) if xt == xt else "",
+                         "QQQ_CAGR%": round(cq, 3) if cq == cq else "", "QQQ_MDD%": round(mq, 2) if mq == mq else "",
+                         "QQQ_배수": round(xq, 3) if xq == xq else ""})
+    S = pd.DataFrame(rows)
+    S.to_csv("summary_r4_compare.csv", index=False, encoding="utf-8-sig")
+    print("-" * 118)
+    print(f"  [V3] 창 무결: {n_win}창(성립 조합) 결측 0건 | [V4] 전창 BOXX 대 IRX ±0.3%p PASS")
+    print("\n  [V5] 산출물 md5 — 칠판 업로드 후 감사역이 raw+캐시버스팅으로 수신·대조:")
+    print(f"      summary_r4_compare.csv : {_md5_file('summary_r4_compare.csv')}  ({len(S)}행)")
+    print(f"      script                 : {self_md5}")
+    # 대표 창 차트(기존 방식 유지: NAV 로그축 + 낙폭, 한글 폰트) — 2000·2010 시작 × 최신 종료
+    try:
+        import matplotlib
+        try:
+            from IPython import get_ipython
+            in_nb = (get_ipython() is not None) or ('google.colab' in __import__('sys').modules)
+        except Exception:
+            in_nb = False
+        if not in_nb: matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+        _setup_korean_font()
+        for sd in ["2000-01-02", "2010-02-11"]:
+            sd_t = pd.Timestamp(sd); ed_t = pd.Timestamp(CMP_END_DATES[-1])
+            if sd_t < D.index[0] or ed_t > D.index[-1]: continue
+            win = D.index[(D.index >= sd_t) & (D.index <= ed_t)]
+            r4 = run_r4(D, win, float(EXTRA_REPAY_PCT), float(MONTHLY_M))
+            nav = r4['nav']; dd = (nav / nav.cummax() - 1) * 100
+            yrs = (nav.index[-1] - nav.index[0]).days / 365.25
+            cg = (nav.iloc[-1] / (FAST_INIT + VR_INIT + float(r4['cf'].sum()))) ** (1 / yrs) - 1
+            fig, (a1, a2) = plt.subplots(2, 1, figsize=(13, 8),
+                                         gridspec_kw={"height_ratios": [3, 1]}, sharex=True)
+            a1.set_title(f"R4 통합주행(비교 모드) {sd}~{CMP_END_DATES[-1]} (M={MONTHLY_M:,.0f}, X={EXTRA_REPAY_PCT}%)")
+            a1.plot(nav.index, nav, lw=1.8, color="crimson",
+                    label=f"통합 NAV (CAGR {cg*100:.1f}%, MDD {dd.min():.1f}%)")
+            a1.set_yscale("log"); a1.set_ylabel("NAV (USD, Log)")
+            a1.legend(fontsize=9); a1.grid(alpha=0.3)
+            a2.fill_between(dd.index, dd, 0, color="crimson", alpha=0.25)
+            a2.set_ylabel("DD (%)"); a2.grid(alpha=0.3)
+            plt.tight_layout()
+            out = f"r4_cmp_chart_{sd}.png"
+            plt.savefig(out, dpi=100, bbox_inches="tight")
+            print(f"  · 차트 저장: {out}")
+            if in_nb:
+                try: plt.show()
+                except Exception: pass
+            plt.close()
+    except Exception as e:
+        print(f"  · 차트 생략({str(e)[:70]})")
+    print("=" * 100)
+
 def main():
     print("=" * 100)
     print("  [R4] 통합주행 — FAST + VR + 방석 한 장부 (사양 v1.1 · 관찰 전용 · 배합 재론 금지 양방향)")
@@ -1545,6 +1681,8 @@ def main():
 
     D = build_master()
     print(f"  · 기준 달력: ^NDX 실거래일 {D.index[0].date()} ~ {D.index[-1].date()} ({len(D)}일)")
+    if ON(COMPARE_MODE):
+        return main_compare(D, self_md5)
     wins = _win_list(D.index)
     scenarios = [("X0", 0.0), (f"X{EXTRA_REPAY_PCT}", float(EXTRA_REPAY_PCT))]
 
@@ -1701,4 +1839,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
