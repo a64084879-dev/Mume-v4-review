@@ -26,23 +26,8 @@ EXTRA_REPAY_PCT = 30
 COMPARE_MODE = "on"
 # ★ on이면 R7 2단계 그릇 대결(D1 현행 vs D2 대안, R1 24창).
 STAGE2_MODE = "on"
-# ★ on이면 R8 최종배치 검증(E 70:10:20 vs F 50:50 vs C 60:40).
+# ★ on이면 R8 최종배치 검증(E 70:10:20 vs F 50:50 vs C 60:40). 다른 모드보다 우선한다.
 R8_MODE = "on"
-# ★ on이면 R9 다이얼 백테스터(아래 ARMS를 은박사님이 직접 조절). 다른 모드보다 우선한다.
-R9_MODE = "on"
-# ★★ 다이얼 — 이 줄들만 고쳐서 재실행하십시오. 형식: ("이름", TQQQ비중, VR%, 방석%)
-#    · TQQQ비중 = FAST 안에서 TQQQ가 차지하는 몫(나머지는 금). 예: 0.60이면 TQQQ 60 : 금 40
-#    · VR% · 방석% = 전체 자금에서 차지하는 %. FAST% = 100 − VR% − 방석%(자동 계산)
-#    · 최대 6팔. 합계는 자동 검산.
-#    · 이번 설정 목적(2026-08-16 은박사님 지시): 본체를 FAST 50:50으로 바꾸는 결정 하에서,
-#      VR을 서비스로 얹을 때 5·10·15% 세 눈금의 실측. 판정 기준 = 은박사님 감내선 −50%
-#      (최신 세계 낙폭이 이 선 안에 남는 최대 VR%가 답). C 60:40은 기준선 참고용.
-#      측정 전용 — 확정은 은박사님 재가로만.
-ARMS = [("50:50 단독",  0.50,  0, 0),
-        ("50:50+VR5",  0.50,  30, 0),
-        ("50:50+VR10", 0.50, 33, 0),
-        ("50:50+VR15", 0.50, 35, 0),
-        ("C 60:40",    0.60,  0, 0)]
 
 import os, hashlib
 import numpy as np
@@ -1425,11 +1410,10 @@ def run_arm(D, win, weights, cush_w, init=R5_INIT):
 
 def run_r4(D, win, x_pct, m_monthly, fast_init=FAST_INIT, vr_init=VR_INIT,
            vr_stock_w=VR_START_STOCK_W, narrate=False, vessel="D1",
-           cush_init=0.0, rebal_fc=False, w=None, fc_ratio=None):
+           cush_init=0.0, rebal_fc=False):
     """통합 장부 1회 주행. 반환 dict(지표·경로). 정본 접점:
        FAST=run_simulation 상태기계 이식(연말 정산·6월 납부만 통합층으로), VR=run_vr 이식(동일),
        방석·적립·2단계·통합 과세 바구니 = 인계장 조문(질의 8건 확정 반영)."""
-    w = W_A if w is None else w                              # ★R9: FAST 내부 가중(기본 = 정본 60:40)
     sub = D.loc[win]
     dates = sub.index
     sig = _signals(sub)                                     # VR 정본 신호(SIGNAL_LAG=1)
@@ -1444,10 +1428,10 @@ def run_r4(D, win, x_pct, m_monthly, fast_init=FAST_INIT, vr_init=VR_INIT,
     n_exit = 0; evac_days = 0
     if fast_init > 0:
         p0 = sub.iloc[0]
-        for t, _w0 in w.items():
+        for t, w in W_A.items():
             px = _exec_px(p0, t, is_open=True)
-            if not pd.isna(px) and _w0 > 0:
-                f_hold, used = _buy(t, fast_init * _w0, px, f_hold, NORMAL_SLIPPAGE)
+            if not pd.isna(px) and w > 0:
+                f_hold, used = _buy(t, fast_init * w, px, f_hold, NORMAL_SLIPPAGE)
                 f_cash -= used
 
     def f_add_real(pr):
@@ -1608,7 +1592,7 @@ def run_r4(D, win, x_pct, m_monthly, fast_init=FAST_INIT, vr_init=VR_INIT,
             elif f_pending in ('go_invest_from_usd', 'go_invest_from_boxx'):
                 note = f_trig.get('note', '')
                 if note.startswith('fast_recover'):
-                    f_rebalance(w, p)                        # F3-False(정본 기본): 전체 재조정(팔 가중)
+                    f_rebalance(W_A, p)                      # F3-False(정본 기본): 전체 60:40 재조정
                 else:
                     if f_pending == 'go_invest_from_usd':
                         f_buy_amt('TQQQ', f_cash, p)
@@ -1621,12 +1605,12 @@ def run_r4(D, win, x_pct, m_monthly, fast_init=FAST_INIT, vr_init=VR_INIT,
         if f_annual_pending and not f_executed and not is_last and fast_init > 0:
             f_annual_pending = False
             if f_state == 'INVESTED':
-                f_rebalance(w, p)
+                f_rebalance(W_A, p)
             elif f_state == 'CASH_BOXX':
-                aw = w.copy(); aw['BOXX'] = aw.get('BOXX', 0) + aw.get('TQQQ', 0); aw['TQQQ'] = 0
+                aw = W_A.copy(); aw['BOXX'] = aw.get('BOXX', 0) + aw.get('TQQQ', 0); aw['TQQQ'] = 0
                 f_rebalance(aw, p)
             elif f_state == 'CASH_USD':
-                aw = w.copy(); aw['TQQQ'] = 0
+                aw = W_A.copy(); aw['TQQQ'] = 0
                 f_rebalance(aw, p)
             f_executed = True
 
@@ -1711,7 +1695,7 @@ def run_r4(D, win, x_pct, m_monthly, fast_init=FAST_INIT, vr_init=VR_INIT,
                     if f_add > 1e-9:                         # 사양 R7-2: 정본 상태 규칙대로 편입
                         if f_state == 'INVESTED':
                             f_cash += f_add
-                            for _t, _w in w.items():
+                            for _t, _w in W_A.items():
                                 if _w > 0: f_buy_amt(_t, f_add * _w, p)
                         elif f_state == 'CASH_BOXX':
                             f_cash += f_add; f_buy_amt('BOXX', f_add, p)
@@ -1753,7 +1737,7 @@ def run_r4(D, win, x_pct, m_monthly, fast_init=FAST_INIT, vr_init=VR_INIT,
             #   발생 실현손익은 통합 바구니 산입, KRX금은 비과세·수수료만(R5 Q4 승계).
             _fv = fast_val(p); _cv2 = cu_val(p); _tot2 = _fv + _cv2
             if _tot2 > 1e-9:
-                _tgt_f = _tot2 * (R8_FC_RATIO if fc_ratio is None else fc_ratio)
+                _tgt_f = _tot2 * R8_FC_RATIO
                 if _fv > _tgt_f + 1e-9:                       # FAST → 방석
                     _need = _fv - _tgt_f
                     _take = min(_need, f_cash); f_cash -= _take
@@ -1769,7 +1753,7 @@ def run_r4(D, win, x_pct, m_monthly, fast_init=FAST_INIT, vr_init=VR_INIT,
                     if _got > 1e-9:
                         f_cash += _got
                         if f_state == 'INVESTED':
-                            for _t, _w in w.items():
+                            for _t, _w in W_A.items():
                                 if _w > 0: f_buy_amt(_t, _got * _w, p)
                         elif f_state == 'CASH_BOXX':
                             f_buy_amt('BOXX', _got, p)
@@ -1849,135 +1833,6 @@ def _annual_table(res):
         rows.append((int(y), float(ye[y]), float(pnl) if pnl == pnl else np.nan))
         prev = ye[y]
     return rows
-
-def main_r9(D, self_md5):
-    """★R9 다이얼 백테스터(측정 도구 — 연구 아님·판정 없음). ARMS를 은박사님이 직접 조절해 실측.
-       엔진 무변경: run_r4(w·fc_ratio 인자)와 run_arm(기존 정합 경로)만 호출한다."""
-    print("  · [다이얼 모드] 최상단 ARMS만 고쳐 재실행하십시오. 팔마다 (이름, TQQQ비중, VR%, 방석%).")
-    print("  · 각주(필수): 측정 전용 — 다이얼을 돌려 특정 구간 최고점을 찾는 것은 과최적화입니다")
-    print("    (R6 교훈: 봉우리는 창마다 움직인다). 배치 확정은 은박사님 재가로만.")
-    assert 1 <= len(ARMS) <= 6, f"팔은 1~6개(현재 {len(ARMS)}개)"
-    print(f"\n  ── 다이얼 설정({len(ARMS)}팔) · 총액 ${R8_TOTAL:,.0f} · 적립 0 ──")
-    print(f"    {'이름':<12}|{'FAST%':>7}|{'TQQQ:금':>10}|{'VR%':>6}|{'방석%':>7}|{'눈금':>7}| 경로")
-    plans = []
-    for nm, tq, vrp, cup in ARMS:
-        fp = 100.0 - vrp - cup
-        assert fp >= 0 and 0 <= tq <= 1, f"[{nm}] 비중 오류: FAST% {fp}, TQQQ비중 {tq}"
-        dial = (fp * tq * 3.0 + vrp * VR_TICK) / 100.0          # 눈금 = 노출 배수
-        w = {'TQQQ': round(tq, 6), 'gold': round(1.0 - tq, 6)}
-        route = "run_arm" if (vrp == 0 and cup == 0) else "run_r4"
-        plans.append((nm, w, fp, vrp, cup, dial, route))
-        print(f"    {nm:<12}|{fp:>6.1f}%|{tq*100:>5.0f}:{(1-tq)*100:<4.0f}|{vrp:>5.1f}%|{cup:>6.1f}%|{dial:>7.3f}| {route}")
-
-    wins = []
-    for y in R1_YEARS:
-        st = D.index[D.index >= f"{y}-01-01"][0]
-        wins.append(("옛", y, D.index[(D.index >= st) & (D.index < st + pd.DateOffset(years=WINDOW_Y))]))
-    for y in START_YEARS:
-        st = D.index[D.index >= f"{y}-01-01"][0]
-        wv = D.index[D.index >= st]
-        if len(wv) >= 60: wins.append(("최신", y, wv))
-    print(f"\n  · 창: 옛 {sum(1 for x in wins if x[0]=='옛')} + 최신 {sum(1 for x in wins if x[0]=='최신')} "
-          f"= {len(wins)}창 × {len(plans)}팔 = {len(wins)*len(plans)}회")
-
-    rows = []; charts = {}
-    for world, y, win in wins:
-        sub = D.loc[win]
-        assert not sub[['TQQQ', 'gold', 'GSPC_RAW', 'NDX_RAW', 'IRXD', 'Bubble_Value']].isna().any().any(), f"{y} 결측"
-        yrs = (win[-1] - win[0]).days / 365.25
-        bx = sub['BOXX']; b_cagr = (bx.iloc[-1] / bx.iloc[0]) ** (1 / yrs) - 1
-        v4 = abs(b_cagr * 100 - float(sub['IRX'].mean()))
-        assert v4 <= 0.3, f"V4 실패 {y}: {v4:.2f}%p"
-        rl = sub['TQQQ'].pct_change().to_numpy()[1:]
-        cmask = rl <= CRISIS_DD
-        store = {}
-        print("\n" + "=" * 112)
-        print(f"  📊 ★시작일 {win[0].date()} [{world} 세계] — 종료일 {win[-1].date()} ({yrs:.2f}년)")
-        print("=" * 112)
-        print(f"   {'자산':^14}|{'눈금':>6}|{'최종자산($)':>15} |{'CAGR':>9} |{'MDD':>9} |{'세금($)':>12} |{'대피':>6}")
-        print("-" * 112)
-        for nm, w, fp, vrp, cup, dial, route in plans:
-            if route == "run_arm":
-                res = run_arm(D, win, w, 0.0, init=R8_TOTAL)
-            else:
-                res = run_r4(D, win, 0.0, 0.0, fast_init=R8_TOTAL * fp / 100.0,
-                             vr_init=R8_TOTAL * vrp / 100.0, cush_init=R8_TOTAL * cup / 100.0,
-                             rebal_fc=(cup > 0), w=w, fc_ratio=(fp / (fp + cup) if (fp + cup) > 0 else None))
-            nav = res['nav']; cf = res['cf']; after = float(nav.iloc[-1])
-            c = (after / R8_TOTAL) ** (1 / yrs) - 1 if after > 0 else float('nan')
-            mdd = float((nav / nav.cummax() - 1).min()) * 100
-            r_adj = ((nav - cf) / nav.shift(1) - 1.0).to_numpy()[1:]
-            worst = float(np.nanmin(r_adj[cmask]) * 100) if cmask.any() else float('nan')
-            rows.append({"세계": world, "창시작연도": y, "팔": nm, "눈금": round(dial, 3),
-                         "FAST%": fp, "TQQQ비중": w['TQQQ'], "VR%": vrp, "방석%": cup,
-                         "시작일": str(win[0].date()), "종료일": str(win[-1].date()), "길이년": round(yrs, 2),
-                         "CAGR%": round(c * 100, 3) if c == c else "", "MDD%": round(mdd, 2),
-                         "최종$": round(after, 0), "세금총액$": round(res['tax_total'], 0),
-                         "위기일최악%": round(worst, 3) if worst == worst else "",
-                         "KS발동": res['n_exit'], "대피일수": res['evac_days']})
-            cg = f"{c*100:>8.2f}%" if c == c else "       —"
-            print(f"   {nm:^14}|{dial:>6.2f}|{after:>15,.0f} |{cg} |{mdd:>8.2f}% |{res['tax_total']:>12,.0f} |{res['evac_days']:>6}")
-            store[nm] = (nav, c, mdd)
-        print("-" * 112)
-        if y in (2000, 2010): charts[y] = (store, win)
-    S = pd.DataFrame(rows)
-    S.to_csv("summary_r9.csv", index=False, encoding="utf-8-sig")
-
-    names = [p_[0] for p_ in plans]
-    for world in ("옛", "최신"):
-        W = S[S.세계 == world]
-        if not len(W): continue
-        print("\n" + "=" * 112)
-        print(f"  [집계] {world} 세계 ({W.창시작연도.nunique()}창) — 팔별 중앙값")
-        print(f"    {'팔':<12}|{'눈금':>6}|{'CAGR 중앙':>11}|{'MDD 중앙':>11}|{'세금 중앙$':>14}|{'위기일 중앙':>12}")
-        for nm in names:
-            T = W[W.팔 == nm]
-            print(f"    {nm:<12}|{T['눈금'].iloc[0]:>6.2f}|{pd.to_numeric(T['CAGR%']).median():>10.2f}%|"
-                  f"{T['MDD%'].median():>10.2f}%|{T['세금총액$'].median():>14,.0f}|{pd.to_numeric(T['위기일최악%']).median():>11.2f}%")
-        base = names[0]
-        for nm in names[1:]:
-            a = W[W.팔 == nm].reset_index(drop=True); b = W[W.팔 == base].reset_index(drop=True)
-            ca, cb = pd.to_numeric(a['CAGR%']), pd.to_numeric(b['CAGR%'])
-            print(f"    · {nm} vs {base}: 수익 {int((ca > cb).sum())}/{len(a)}창 · "
-                  f"낙폭 얕음 {int((a['MDD%'] > b['MDD%']).sum())}/{len(a)}창 · "
-                  f"세금 적음 {int((a['세금총액$'] < b['세금총액$']).sum())}/{len(a)}창")
-
-    print("\n  [V5] 산출물 md5:")
-    print(f"      summary_r9.csv : {_md5_file('summary_r9.csv')}  ({len(S)}행)")
-    print(f"      script         : {self_md5}")
-    try:
-        import matplotlib
-        try:
-            from IPython import get_ipython
-            in_nb = (get_ipython() is not None) or ('google.colab' in __import__('sys').modules)
-        except Exception:
-            in_nb = False
-        if not in_nb: matplotlib.use("Agg")
-        import matplotlib.pyplot as plt
-        _setup_korean_font()
-        palette = ["#7f7f7f", "#1f77b4", "#2ca02c", "crimson", "#ff7f0e", "#9467bd"]
-        for y, (store, win) in sorted(charts.items()):
-            fig, (a1, a2) = plt.subplots(2, 1, figsize=(13, 8),
-                                         gridspec_kw={"height_ratios": [3, 1]}, sharex=True)
-            a1.set_title(f"R9 다이얼 {y} 시작 ({win[0].date()}~{win[-1].date()}) — 총액 ${R8_TOTAL:,.0f}·적립 0")
-            for k, (nm, w, fp, vrp, cup, dial, route) in enumerate(plans):
-                if nm not in store: continue
-                nav, c, mdd = store[nm]
-                a1.plot(nav.index, nav, lw=1.5, color=palette[k % len(palette)],
-                        label=f"{nm} 눈금{dial:.2f} (CAGR {c*100:.1f}%, MDD {mdd:.1f}%)")
-                a2.plot(nav.index, (nav / nav.cummax() - 1) * 100, lw=1.0, color=palette[k % len(palette)])
-            a1.set_yscale("log"); a1.set_ylabel("NAV (USD, Log)"); a1.legend(fontsize=9); a1.grid(alpha=0.3)
-            a2.set_ylabel("DD (%)"); a2.grid(alpha=0.3)
-            plt.tight_layout(); out = f"r9_chart_{y}.png"
-            plt.savefig(out, dpi=100, bbox_inches="tight")
-            print(f"  · 차트 저장: {out}")
-            if in_nb:
-                try: plt.show()
-                except Exception: pass
-            plt.close()
-    except Exception as e:
-        print(f"  · 차트 생략({str(e)[:70]})")
-    print("=" * 112)
 
 def main_r8(D, self_md5):
     """★R8 신설(사양 R8-1~R8-6): 최종배치 검증 — E(FAST 70:VR 10:방석 20) vs F(50:50 단독) vs C(60:40 단독).
@@ -2066,7 +1921,19 @@ def main_r8(D, self_md5):
             line.append(f"{arm} {c*100:6.2f}%/{mdd:6.1f}%/세${res['tax_total']:>9,.0f}")
             store[arm] = (nav, c, mdd)
         if y in (2000, 2010): charts[y] = (store, win)
-        print(f"    [{world}] {y}: {win[0].date()}~{win[-1].date()} {yrs:5.2f}년 | " + " | ".join(line))
+        # ── 출력 형식(2026-08-16 은박사님 지시): 시작일별 블록 표 ──
+        print("\n" + "=" * 108)
+        print(f"  📊 ★시작일 {win[0].date()} [{world} 세계] — 종료일 {win[-1].date()} ({yrs:.2f}년)")
+        print("=" * 108)
+        print(f"   {'종료일':^12}|{'자산':^28}|{'최종자산($)':>14} |{'CAGR':>9} |{'MDD':>9} |{'세금($)':>12} |{'대피':>5}")
+        print("-" * 108)
+        for arm in ("E", "F", "C"):
+            r = rows[-3 + ("EFC".index(arm))]
+            nm = {"E": "E(FAST70:VR10:방석20)", "F": "F(TQQQ50:gold50)", "C": "C(TQQQ60:gold40)"}[arm]
+            cg = f"{r['CAGR%']:>8.2f}%" if r['CAGR%'] != "" else "       —"
+            print(f"   {str(win[-1].date()):^12}|{nm:^28}|{r['최종$']:>14,.0f} |{cg} |{r['MDD%']:>8.2f}% |"
+                  f"{r['세금총액$']:>12,.0f} |{r['대피일수']:>5}")
+        print("-" * 108)
     S = pd.DataFrame(rows)
     S.to_csv("summary_r8.csv", index=False, encoding="utf-8-sig")
 
@@ -2414,8 +2281,6 @@ def main():
 
     D = build_master()
     print(f"  · 기준 달력: ^NDX 실거래일 {D.index[0].date()} ~ {D.index[-1].date()} ({len(D)}일)")
-    if ON(R9_MODE):
-        return main_r9(D, self_md5)
     if ON(R8_MODE):
         return main_r8(D, self_md5)
     if ON(STAGE2_MODE):
