@@ -42,7 +42,11 @@ ARMS = [("E 70:10:20",  0.60, 10, 20),
         ("50:50+VR35",  0.50, 35,  0),
         ("VR35 눈금맞춤", 0.50, 35, 26),
         ("C 60:40",     0.60,  0,  0)]
-
+# ★ 창 격자 — 시작일 × 종료일 조합으로 측정(2026-08-17 은박사님 지시)
+R9_START_DATES = ["1986-08-11", "1994-01-02", "1998-01-02", "2000-01-02", "2010-02-11",
+                  "2013-01-02", "2016-01-02", "2019-01-02", "2022-01-02", "2024-01-02"]
+R9_END_DATES   = ["2018-12-31", "2020-12-31", "2021-12-31", "2022-12-30", "2024-12-31", "2026-07-10"]
+R9_MIN_YEARS   = 1.0        # 이보다 짧은 조합은 자동 제외
 import os, hashlib
 import numpy as np
 import pandas as pd
@@ -1869,15 +1873,16 @@ def main_r9(D, self_md5):
         print(f"    {nm:<12}|{fp:>6.1f}%|{tq*100:>5.0f}:{(1-tq)*100:<4.0f}|{vrp:>5.1f}%|{cup:>6.1f}%|{dial:>7.3f}| {route}")
 
     wins = []
-    for y in R1_YEARS:
-        st = D.index[D.index >= f"{y}-01-01"][0]
-        wins.append(("옛", y, D.index[(D.index >= st) & (D.index < st + pd.DateOffset(years=WINDOW_Y))]))
-    for y in START_YEARS:
-        st = D.index[D.index >= f"{y}-01-01"][0]
-        wv = D.index[D.index >= st]
-        if len(wv) >= 60: wins.append(("최신", y, wv))
-    print(f"\n  · 창: 옛 {sum(1 for x in wins if x[0]=='옛')} + 최신 {sum(1 for x in wins if x[0]=='최신')} "
-          f"= {len(wins)}창 × {len(plans)}팔 = {len(wins)*len(plans)}회")
+    for sd in R9_START_DATES:
+        for ed in R9_END_DATES:
+            s_ts, e_ts = pd.Timestamp(sd), pd.Timestamp(ed)
+            if e_ts <= s_ts: continue
+            wv = D.index[(D.index >= s_ts) & (D.index <= e_ts)]
+            if len(wv) < 60: continue
+            if (wv[-1] - wv[0]).days / 365.25 < R9_MIN_YEARS: continue
+            wins.append((f"{s_ts:%Y}→{e_ts:%Y}", f"{sd}~{ed}", wv))
+    print(f"\n  · 창 격자: 시작 {len(R9_START_DATES)} × 종료 {len(R9_END_DATES)} "
+          f"→ 유효 {len(wins)}창 × {len(plans)}팔 = {len(wins)*len(plans)}회")
 
     rows = []; charts = {}
     for world, y, win in wins:
