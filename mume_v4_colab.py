@@ -86,7 +86,7 @@ TAX_EXEMPTION = TAX_DEDUCTION_KRW / FX_KRWUSD      # ≈ $1,785.71
 NORMAL_SLIPPAGE = 0.0
 COMMISSION = US_FEE
 B1_PCTL = 0.75
-EXIT_INDEX = "NDX"; GATE_MODE = "ABS"; REC_HOT_INDEX = "GSPC"
+EXIT_INDEX = "GSPC"; GATE_MODE = "ABS"; REC_HOT_INDEX = "GSPC"
 RECOVER_BOOST = {'TQQQ': 0.60, 'gold': 0.40}
 FAST_RECOVER_KEEPS_GOLD = False
 # ── VR 정본 전역(823903a7 기본값 그대로) ──
@@ -406,8 +406,8 @@ def _signals(d):
         index=d.index)
 
     sig = {
-        "G":    sh(d["NDX"]),    # ★탈출 기준선 = 나스닥100 (2026-08-08 비대칭 확정, 은박사 승인)
-        "GS":   sh(d["NSMA"]),
+        "G":    sh(d["GSPC"]),   # ★R6-b 재주행: 탈출 기준선 = S&P500 (2026-08-17 은박사님 재가)
+        "GS":   sh(d["GSMA"]),
         "RG":   sh(d["GSPC"]),   # ★복귀 기준선 = S&P500 (느린 복귀 — 닿컴형 왕복 방어)
         "RGS":  sh(d["GSMA"]),
         "NX":   sh(d["NDX"]),
@@ -1352,8 +1352,9 @@ def run_arm(D, win, weights, cush_w, init=R5_INIT):
             gspc = p['GSPC_RAW']; gsma = p['SPY_SMA200']
             ndx_ = p['NDX_RAW']; nsma = p['NDX_SMA200']; bub = p['Bubble_Value']
             gate_hot = (bub >= BUBBLE_LIMIT)
+            exit_px, exit_sma = (ndx_, nsma) if EXIT_INDEX == "NDX" else (gspc, gsma)
             if f_state == 'INVESTED':
-                if gate_hot and ndx_ < nsma:
+                if gate_hot and exit_px < exit_sma:
                     f_pending = 'go_cash'; f_trig = {'note': 'exit'}; n_exit += 1
             elif f_state in ('CASH_USD', 'CASH_BOXX') and is_month_end:
                 spx_ok = gspc > gsma
@@ -1638,8 +1639,9 @@ def run_r4(D, win, x_pct, m_monthly, fast_init=FAST_INIT, vr_init=VR_INIT,
             gspc = p['GSPC_RAW']; gsma = p['SPY_SMA200']
             ndx = p['NDX_RAW']; nsma = p['NDX_SMA200']; bub = p['Bubble_Value']
             gate_hot = (bub >= BUBBLE_LIMIT)
+            exit_px, exit_sma = (ndx, nsma) if EXIT_INDEX == "NDX" else (gspc, gsma)
             if f_state == 'INVESTED':
-                if gate_hot and ndx < nsma:
+                if gate_hot and exit_px < exit_sma:
                     f_pending = 'go_cash'; f_trig = {'note': 'exit'}; n_exit += 1
             elif f_state in ('CASH_USD', 'CASH_BOXX') and is_month_end:
                 spx_ok = gspc > gsma
@@ -1857,6 +1859,7 @@ def main_r9(D, self_md5):
     """★R9 다이얼 백테스터(측정 도구 — 연구 아님·판정 없음). ARMS를 은박사님이 직접 조절해 실측.
        엔진 무변경: run_r4(w·fc_ratio 인자)와 run_arm(기존 정합 경로)만 호출한다."""
     print("  · [다이얼 모드] 최상단 ARMS만 고쳐 재실행하십시오. 팔마다 (이름, TQQQ비중, VR%, 방석%).")
+    print("  · R6-b: 탈출선=S&P500 (복귀선=S&P500 공통)")
     print("  · 각주(필수): 측정 전용 — 다이얼을 돌려 특정 구간 최고점을 찾는 것은 과최적화입니다")
     print("    (R6 교훈: 봉우리는 창마다 움직인다). 배치 확정은 은박사님 재가로만.")
     assert 1 <= len(ARMS) <= 6, f"팔은 1~6개(현재 {len(ARMS)}개)"
@@ -1925,7 +1928,7 @@ def main_r9(D, self_md5):
         print("-" * 112)
         if y in (2000, 2010): charts[y] = (store, win)
     S = pd.DataFrame(rows)
-    S.to_csv("summary_r9.csv", index=False, encoding="utf-8-sig")
+    S.to_csv("summary_r9b.csv", index=False, encoding="utf-8-sig")
 
     names = [p_[0] for p_ in plans]
     for world in ("옛", "최신"):
@@ -1947,7 +1950,7 @@ def main_r9(D, self_md5):
                   f"세금 적음 {int((a['세금총액$'] < b['세금총액$']).sum())}/{len(a)}창")
 
     print("\n  [V5] 산출물 md5:")
-    print(f"      summary_r9.csv : {_md5_file('summary_r9.csv')}  ({len(S)}행)")
+    print(f"      summary_r9b.csv : {_md5_file('summary_r9b.csv')}  ({len(S)}행)")
     print(f"      script         : {self_md5}")
     try:
         import matplotlib
@@ -1972,7 +1975,7 @@ def main_r9(D, self_md5):
                 a2.plot(nav.index, (nav / nav.cummax() - 1) * 100, lw=1.0, color=palette[k % len(palette)])
             a1.set_yscale("log"); a1.set_ylabel("NAV (USD, Log)"); a1.legend(fontsize=9); a1.grid(alpha=0.3)
             a2.set_ylabel("DD (%)"); a2.grid(alpha=0.3)
-            plt.tight_layout(); out = f"r9_chart_{y}.png"
+            plt.tight_layout(); out = f"r9b_chart_{y}.png"
             plt.savefig(out, dpi=100, bbox_inches="tight")
             print(f"  · 차트 저장: {out}")
             if in_nb:
