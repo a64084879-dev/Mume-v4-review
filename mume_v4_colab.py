@@ -1,145 +1,24 @@
---- /mnt/user-data/outputs/fs_scorecard.py	2026-08-22 10:02:30.066371000 +0000
-+++ fs_scorecard.py	2026-08-22 11:02:59.153898650 +0000
-@@ -32,6 +32,13 @@
- RET_WIN2       = 252       # 병기 전용(채점 기준은 126 고정)
- RET_DD         = 0.10
- FETCH_START    = "1985-10-01"
-+# ── 신용 c(t) 3원 접합(추록1 §2, 2026-08-22 재가): 임계·판정식 무변경 ──
-+MIRROR_URL     = "https://raw.githubusercontent.com/csaladenes/eco-archive/master/BAMLH0A0HYM2.csv"
-+MIRROR_MD5     = "ec8668ebf7bd9e5a7cf68e15c993482c"   # 고정 — 불일치 시 실행 중단(추록1 §3a)
-+HY_CUT         = "1996-12-31"     # 이전 = 폴백(기존)
-+MIRROR_END     = "2021-03-19"     # 미러 구간 끝
-+GAP_END        = "2023-08-21"     # 공백(폴백) 구간 끝 — 이후 = 현행 FRED
-+FRESH_DAYS     = 14               # 추록1 §3c: 현행 구간 마지막 관측 최신성
- EXIT_INDEX     = "NDX"     # 명세 §3-1: 사건 수 대조는 동일 설정 실행분과만
- FRED_CSV       = "https://fred.stlouisfed.org/graph/fredgraph.csv?id={sid}&cosd=1985-10-01"   # ★수정1: 기본 3년창 방지
- M0_PATHS       = ["m0_full.csv", "/content/drive/MyDrive/m0_full.csv"]
-@@ -84,6 +91,36 @@
-                          f"신용 채점 무효 방지를 위해 실행을 멈춥니다(감사역 수정 2).")
-     return s
- 
-+def fetch_mirror():
-+    """추록1 §2: GitHub 미러(1996-12-31~2021-03-19). 캐시 로컬+드라이브 — 사용 전마다 md5 재검증,
-+       다운로드본도 md5 불일치면 즉시 중단(행수가 아니라 md5로 가드)."""
-+    fn = "hy_mirror_BAMLH0A0HYM2.csv"
-+    db = _ensure_drive()
-+    raw = None
-+    for p_ in [fn] + ([f"{db}/{fn}"] if db else []):
-+        if os.path.exists(p_):
-+            b = open(p_, 'rb').read()
-+            if hashlib.md5(b).hexdigest() == MIRROR_MD5:
-+                print(f"  · 미러 캐시 사용: {p_} (md5 일치 {MIRROR_MD5[:8]})")
-+                raw = b; break
-+            print(f"  · 미러 캐시 md5 불일치({p_}) — 무시하고 재수신")
-+    if raw is None:
-+        r = requests.get(MIRROR_URL, timeout=60); r.raise_for_status()
-+        raw = r.content
-+        got = hashlib.md5(raw).hexdigest()
-+        if got != MIRROR_MD5:
-+            raise SystemExit(f"★중단: 미러 md5 {got[:8]} ≠ 고정 {MIRROR_MD5[:8]} — 무결성 실패(추록1 §3a).")
-+        open(fn, 'wb').write(raw)
-+        if db:
-+            try: open(f"{db}/{fn}", 'wb').write(raw)
-+            except Exception: pass
-+        print(f"  · 미러 수신: md5 일치 {MIRROR_MD5[:8]} — 캐시 로컬{'+드라이브' if db else ''} 저장")
-+    df = pd.read_csv(io.BytesIO(raw))
-+    df.columns = ['DATE', 'V']
-+    s = pd.to_numeric(df.set_index(pd.to_datetime(df['DATE']))['V'], errors='coerce').dropna()
-+    print(f"  · 미러 유효 관측 {len(s)}개 ({s.index[0].date()}~{s.index[-1].date()}) — 결측 자동 제거")
-+    return s
-+
- def fetch_m0():
-     """M0(BOGMBASE, 십억$) — 백테스터 정본 캐시(m0_full.csv) 우선 재사용(명세 §1)."""
-     db = _ensure_drive()
-@@ -149,16 +186,28 @@
-     sahm = ma3 - ma3.rolling(12).min()                      # 명세 §0 정의(자체 계산)
-     avail = sahm.copy()
-     avail.index = (sahm.index + pd.offsets.MonthBegin(1)) + pd.Timedelta(days=9)   # M+1월 10일
--    hy = fetch_fred("BAMLH0A0HYM2", max_start="1997-01-10")   # ★수정2: 절단 수신 시 중단
-+    hy_new = fetch_fred("BAMLH0A0HYM2")                        # 현행 3년 롤링 창(추록1 §2)
-+    if (pd.Timestamp.now().normalize() - hy_new.index[-1]).days > FRESH_DAYS:
-+        raise SystemExit(f"★중단: 현행 FRED 마지막 관측 {hy_new.index[-1].date()}가 "
-+                         f"실행일 기준 {FRESH_DAYS}일 초과(추록1 §3c).")
-+    mir = fetch_mirror()
-     baa = fetch_fred("DBAA"); g10 = fetch_fred("DGS10")
-     fb = (baa - g10.reindex(baa.index).ffill()).dropna()
--    cut = pd.Timestamp("1996-12-31")
--    c = pd.concat([fb[fb.index < cut], hy[hy.index >= cut]]).sort_index()
-+    cut, me, ge = pd.Timestamp(HY_CUT), pd.Timestamp(MIRROR_END), pd.Timestamp(GAP_END)
-+    c = pd.concat([fb[fb.index < cut],                          # ~1996-12-30 폴백(기존)
-+                   mir[(mir.index >= cut) & (mir.index <= me)], # 미러
-+                   fb[(fb.index > me) & (fb.index <= ge)],      # 공백 폴백(사건 0건 — 추록1 §2)
-+                   hy_new[hy_new.index > ge]]).sort_index()     # 현행
-     c = c[~c.index.duplicated()]
--    ov = pd.concat([fb, hy], axis=1, keys=['fb', 'hy']).dropna()
--    if len(ov) > 50:
--        print(f"  · 폴백 겹침 보고(1997~): 상관 {ov['fb'].corr(ov['hy']):.3f} · "
--              f"평균 수준차(하이일드−폴백) {float((ov['hy']-ov['fb']).mean()):+.2f}%p ({len(ov)}일)")
-+    if c.index[0] > pd.Timestamp("1997-01-10"):
-+        raise SystemExit(f"★중단: 접합 후 c(t) 시작일 {c.index[0].date()} > 1997-01-10(추록1 §3b).")
-+    ov1 = pd.concat([fb, mir], axis=1, keys=['fb', 'x']).dropna()
-+    ov2 = pd.concat([fb, hy_new], axis=1, keys=['fb', 'x']).dropna()
-+    print(f"  · 겹침 보고 ①폴백↔미러(1996-12-31~{MIRROR_END}): 상관 {ov1['fb'].corr(ov1['x']):.3f} · "
-+          f"수준차(미러−폴백) {float((ov1['x']-ov1['fb']).mean()):+.2f}%p ({len(ov1)}일)")
-+    print(f"  · 겹침 보고 ②폴백↔현행(2023-08-22~): 상관 {ov2['fb'].corr(ov2['x']):.3f} · "
-+          f"수준차(현행−폴백) {float((ov2['x']-ov2['fb']).mean()):+.2f}%p ({len(ov2)}일)")
-+    print("  · 미러↔현행 직접 겹침 없음(공백 2021-03-20~2023-08-21 존재 — 폴백으로 접합, 추록1 §4)")
-     usrec = fetch_fred("USREC", min_rows=50)
-     return sahm, sahm_rt, avail, c, usrec
- 
-@@ -173,6 +222,16 @@
-     cv = float(s.iloc[-1])
-     return cv, float(cv - s.iloc[-MIN126:].min()), float(cv - s.iloc[-1 - D20])
- 
-+def _src_of(c, t):
-+    """채점에 쓰인 c(t)의 소스(추록1 §4): 전일 마지막 관측일 기준."""
-+    s = c[c.index < t]
-+    if not len(s): return "결측"
-+    d = s.index[-1]
-+    if d < pd.Timestamp(HY_CUT): return "폴백"
-+    if d <= pd.Timestamp(MIRROR_END): return "미러"
-+    if d <= pd.Timestamp(GAP_END): return "폴백"
-+    return "현행"
-+
- def main():
-     print("=" * 110)
-     print("  [거짓 탈출·복귀 채점표] 명세 v1(md5 0931ca7e) — 관찰 전용 · 킬스위치 판정 무변경 · 임계 사전 고정")
-@@ -226,7 +285,7 @@
-                             스프레드=(round(cv, 2) if cv == cv else "결측"),
-                             초과min126=(round(over, 2) if over == over else ""), Δ20=(round(d20, 2) if d20 == d20 else ""),
-                             S2=s2, 점수=E, 추가하락pct=round(dd * 100, 1), USREC=int(has_rec),
--                            정답=truth, 판정=hit))
-+                            소스=_src_of(c, t), 정답=truth, 판정=hit))
- 
-     # ── 복귀 채점 ──
-     rt_rows = []
-@@ -254,7 +313,7 @@
-         rt_rows.append(dict(종류="복귀", 날짜=str(t.date()), 탈출일=str(ed.date()) if ed is not None else "",
-                             버블=round(r['bub'], 3), 스프레드=(round(cv, 2) if cv == cv else "결측"),
-                             peak=(round(peak, 2) if peak == peak else ""), Δ20=(round(d20, 2) if d20 == d20 else ""),
--                            점수=R, 정답=truth, 정답252=t252, 판정=hit))
-+                            점수=R, 소스=_src_of(c, t), 정답=truth, 정답252=t252, 판정=hit))
- 
-     T = pd.DataFrame(ex_rows + rt_rows)
-     T.to_csv("fs_scorecard.csv", index=False, encoding="utf-8-sig")
-@@ -263,16 +322,16 @@
-     print("\n" + "-" * 110)
-     print("  [채점표 — 탈출]  (지표는 전일 기준 · Sahm은 발표지연 반영 가용 최신월)")
-     print(f"   {'날짜':^12}|{'버블':>6}|{'Sahm':>6}|{'S1':>3}|{'스프레드':>8}|{'초과':>6}|{'Δ20':>6}|{'S2':>3}|"
--          f"{'E':>3}|{'추가하락':>8}|{'REC':>4}|{'정답':^4}|{'판정':^4}")
-+          f"{'E':>3}|{'추가하락':>8}|{'REC':>4}|{'소스':^4}|{'정답':^4}|{'판정':^4}")
-     for r in ex_rows:
-         print(f"   {r['날짜']:^12}|{r['버블']:>6}|{str(r['Sahm']):>6}|{r['S1']:>3}|{str(r['스프레드']):>8}|"
-               f"{str(r['초과min126']):>6}|{str(r['Δ20']):>6}|{r['S2']:>3}|{r['점수']:>3}|"
--              f"{r['추가하락pct']:>7.1f}%|{r['USREC']:>4}|{r['정답']:^4}|{r['판정']:^4}")
-+              f"{r['추가하락pct']:>7.1f}%|{r['USREC']:>4}|{r['소스']:^4}|{r['정답']:^4}|{r['판정']:^4}")
-     print("\n  [채점표 — 복귀]  (peak = 대피 에피소드 내 스프레드 최고)")
--    print(f"   {'날짜':^12}|{'탈출일':^12}|{'스프레드':>8}|{'peak':>7}|{'Δ20':>6}|{'R':>3}|{'정답':^4}|{'252일':^5}|{'판정':^4}")
-+    print(f"   {'날짜':^12}|{'탈출일':^12}|{'스프레드':>8}|{'peak':>7}|{'Δ20':>6}|{'R':>3}|{'소스':^4}|{'정답':^4}|{'252일':^5}|{'판정':^4}")
-     for r in rt_rows:
-         print(f"   {r['날짜']:^12}|{r['탈출일']:^12}|{str(r['스프레드']):>8}|{str(r['peak']):>7}|"
--              f"{str(r['Δ20']):>6}|{r['점수']:>3}|{r['정답']:^4}|{r['정답252']:^5}|{r['판정']:^4}")
-+              f"{str(r['Δ20']):>6}|{r['점수']:>3}|{r['소스']:^4}|{r['정답']:^4}|{r['정답252']:^5}|{r['판정']:^4}")
- 
-     # ── 혼동행렬(신호별·합산) ──
-     def _mat(rows, key, name):
+# 거짓 탈출·복귀 판정 명세서 v1 — 추록2 개정판 (FAST·B1 게이트 확장 채점)
+- 작성: Claude(감사역) 2026-08-22 / 구현: Gemini
+- **폐기 고지: 추록2 초판(ded94015)은 감사역 오류로 전면 폐기한다.** 오류 내용 — ①탈출지수를 GSPC로 잘못 지정(정답: NDX 고정) ②적용 대상을 VR 대피 로직으로 오독(정답: FAST 킬스위치의 게이트 모드 B1) ③B1_PCTL을 실전 봇에서 확정하라는 불필요 절차(정답: 백테스터에 0.75로 고정돼 있음) ④VR 대피 횟수 대조 앵커(폐기).
+
+## 1. B1의 정확한 정의 (백테스터 원문 기준)
+B1은 FAST 킬스위치의 **게이트(무장 조건) 모드**다. 백테스터(TQQQ50금50 v3tax) 157~162행: GATE_MODE = "ABS"(버블≥1.30, 현행) | **"B1"(버블의 10년 롤링 백분위 ≥ B1_PCTL=0.75)** | "NONE". K2(2026-08-06)로 VR의 백분위 블록이 불변 이식돼 있다(734~741행: 당일 포함 롤링 = 미래정보 없음, 최소 252일 미달 초기 ~3년은 NaN → 게이트 미발동). 탈출지수는 **NDX 고정(2026-08-06 확정)**, 복귀는 GSPC 월말(비대칭)·냉게이트 빠른복귀 — 게이트를 제외한 모든 규칙은 FAST 현행 그대로다. 이 확장은 백테스터에 **사전 등록된 주 판정축(1461행: GATE=B1 · 2010 이후 6창 · EXIT=NDX 고정)**과 동일한 축을 채점하는 것이다.
+
+## 2. 구현 — fs_scorecard v3(76ebc5ca)에서 게이트 판정 한 곳만 교체
+- 게이트 함수: `gate_hot(d) = 버블(GSPC/M0)의 10년(2,520거래일, min_periods 252) 롤링 백분위(당일 포함) ≥ 0.75` — 백테스터 K2 블록 자구 이식. NaN이면 False(게이트 닫힘).
+- 이 게이트 함수는 **무장 판정과 복귀 핫/콜드 분기 양쪽에 공용**한다(v3의 `bub ≥ 1.30` 사용처 전부 교체). 탈출(NDX<SMA200 일일)·복귀(GSPC>SMA200 월말, 콜드면 NDX 빠른복귀)·전일 데이터 규칙·E/R 판정식·임계·라벨은 **전부 무변경**.
+- 기존 FAST-ABS 표(26·26건)는 그대로 두고 **FAST-B1 표를 별도 절로 추가**한다(모집단 혼합 금지). 사건표에 '백분위'(게이트값)·'소스' 열 표기.
+- 잠정 라벨 규칙: 복귀 후 126거래일 창이 데이터 끝까지 미충족인 사건은 정답에 "(잠정)" 표기 — 2026년 복귀가 해당할 수 있다.
+
+## 3. 산출물
+FAST-B1 채점표(탈출·복귀)·혼동행렬·기준선 대조·2단 타임라인 차트(NDX 로그+마킹)·fs_scorecard_b1.csv md5 — Colab 표준 준수.
+
+## 4. 무결성 대조(감사 항목)
+백테스터(TQQQ50금50 v3tax)를 GATE_MODE="B1"·EXIT=NDX·fast_recover로 1회 실행한 대피·복귀 **날짜 전건**과 상호 대조한다(신호일↔실행일 ±1일 관행 차 허용). 불일치 시 사건 엔진 이식 오류로 간주, 실행 중단·보고.
+
+## 5. 사전 예상(감사역 근사 — 실측이 정본, 대조용)
+백분위 게이트는 최신 분포에 적응하므로 2010년 이후에도 무장 구간이 생기고 사건이 다수 추가될 것(후보: 2015~16, 2018, 2020, 2022, 2025, 2026 이탈기). 이 중 2020년 3월·2025년 봄은 스프레드 급확장기라 E=+1 후보 — 켜지고 그 사건이 진짜(2020)/거짓(2025)으로 갈리면 E의 현대 성적이 정확히 측정된다. 예단 금지, 실측으로 확정.
+
+## 6. 절차
+Gemini 구현(v3 대비 패치) → 칠판 게시 → 감사역 diff→md5 재현·정적 검사 → 실행 → §4 날짜 대조 + 손대조 3건 이상 → 판정(§3-5 준용) → 결과메모 갱신 여부 은박사님 결정. 관찰 전용 — 매매 개입 금지(결과메모 2cbd0b57 전례 C~E) 재확인.
