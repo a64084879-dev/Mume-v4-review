@@ -39,10 +39,17 @@ R9_MODE = "on"
 #      (최신 세계 낙폭이 이 선 안에 남는 최대 VR%가 답). C 60:40은 기준선 참고용.
 #      측정 전용 — 확정은 은박사님 재가로만.
 ARMS = [("50:50 단독",  0.50,  0, 0),
-        ("50:50+VR5",  0.50,  30, 0),
-        ("50:50+VR10", 0.50, 33, 0),
+        ("50:50+VR5",  0.50,  15, 0),
+        ("50:50+VR10", 0.50, 25, 0),
         ("50:50+VR15", 0.50, 35, 0),
         ("C 60:40",    0.60,  0, 0)]
+# ★ 창 격자 — 시작일 × 종료일 조합으로 측정(2026-08-17 은박사님 지시)
+#   · 종전: 17년 고정창(옛 세계) + 데이터끝까지(최신 세계)  →  변경: 아래 두 리스트의 모든 조합
+#   · 종료일 ≤ 시작일 이거나 R9_MIN_YEARS 미만인 조합은 자동 제외
+R9_START_DATES = ["2000-01-02","2003-01-02", "2006-01-02", "2009-01-02", "2010-02-11",
+                  "2013-01-02", "2016-01-02", "2019-01-02", "2022-01-02", "2024-01-02"]
+R9_END_DATES   = ["2018-12-31", "2020-12-31", "2021-12-31", "2022-12-30", "2024-12-31", "2026-08-25"]
+R9_MIN_YEARS   = 0.9        # 이보다 짧은 조합은 자동 제외
 
 import os, hashlib
 import numpy as np
@@ -1869,16 +1876,30 @@ def main_r9(D, self_md5):
         plans.append((nm, w, fp, vrp, cup, dial, route))
         print(f"    {nm:<12}|{fp:>6.1f}%|{tq*100:>5.0f}:{(1-tq)*100:<4.0f}|{vrp:>5.1f}%|{cup:>6.1f}%|{dial:>7.3f}| {route}")
 
-    wins = []
-    for y in R1_YEARS:
-        st = D.index[D.index >= f"{y}-01-01"][0]
-        wins.append(("옛", y, D.index[(D.index >= st) & (D.index < st + pd.DateOffset(years=WINDOW_Y))]))
-    for y in START_YEARS:
-        st = D.index[D.index >= f"{y}-01-01"][0]
-        wv = D.index[D.index >= st]
-        if len(wv) >= 60: wins.append(("최신", y, wv))
-    print(f"\n  · 창: 옛 {sum(1 for x in wins if x[0]=='옛')} + 최신 {sum(1 for x in wins if x[0]=='최신')} "
-          f"= {len(wins)}창 × {len(plans)}팔 = {len(wins)*len(plans)}회")
+    wins = []          # ★격자: (종료일라벨, 시작일, 창인덱스)
+    skipped = []
+    for sd in R9_START_DATES:
+        sd_t = pd.Timestamp(sd)
+        if sd_t < D.index[0]:
+            skipped.append(f"{sd}(데이터 이전)"); continue
+        for ed in R9_END_DATES:
+            ed_t = pd.Timestamp(ed)
+            if ed_t <= sd_t:
+                continue                                   # 종료 <= 시작 — 성립 불가
+            if ed_t > D.index[-1]:
+                skipped.append(f"~{ed}(데이터 이후)"); continue
+            wv = D.index[(D.index >= sd_t) & (D.index <= ed_t)]
+            if len(wv) < 60:
+                continue
+            if (wv[-1] - wv[0]).days / 365.25 < R9_MIN_YEARS:
+                continue                                   # R9_MIN_YEARS 미만 자동 제외
+            wins.append((ed, sd, wv))
+    assert wins, "성립하는 창 조합이 없습니다 — R9_START_DATES·R9_END_DATES를 확인하십시오"
+    print(f"\n  · 격자: 시작 {len(R9_START_DATES)} x 종료 {len(R9_END_DATES)} = 최대 "
+          f"{len(R9_START_DATES)*len(R9_END_DATES)}조합 -> 성립 {len(wins)}조합 x {len(plans)}팔 "
+          f"= {len(wins)*len(plans)}회 (종료<=시작 · {R9_MIN_YEARS}년 미만 자동 제외)")
+    if skipped:
+        print(f"    · 제외(데이터 범위 밖): {', '.join(sorted(set(skipped)))}")
 
     rows = []; charts = {}
     for world, y, win in wins:
@@ -1892,7 +1913,7 @@ def main_r9(D, self_md5):
         cmask = rl <= CRISIS_DD
         store = {}
         print("\n" + "=" * 112)
-        print(f"  📊 ★시작일 {win[0].date()} [{world} 세계] — 종료일 {win[-1].date()} ({yrs:.2f}년)")
+        print(f"  📊 ★시작일 {win[0].date()} → 종료일 {win[-1].date()} ({yrs:.2f}년)")
         print("=" * 112)
         print(f"   {'자산':^14}|{'눈금':>6}|{'최종자산($)':>15} |{'CAGR':>9} |{'MDD':>9} |{'세금($)':>12} |{'대피':>6}")
         print("-" * 112)
@@ -1919,16 +1940,18 @@ def main_r9(D, self_md5):
             print(f"   {nm:^14}|{dial:>6.2f}|{after:>15,.0f} |{cg} |{mdd:>8.2f}% |{res['tax_total']:>12,.0f} |{res['evac_days']:>6}")
             store[nm] = (nav, c, mdd)
         print("-" * 112)
-        if y in (2000, 2010): charts[y] = (store, win)
+        if y in ("2000-01-02", "2010-02-11") and world == R9_END_DATES[-1]:
+            charts[y] = (store, win)                       # 대표 시작일 x 최종 종료일
     S = pd.DataFrame(rows)
     S.to_csv("summary_r9.csv", index=False, encoding="utf-8-sig")
 
     names = [p_[0] for p_ in plans]
-    for world in ("옛", "최신"):
-        W = S[S.세계 == world]
+    for world in list(R9_END_DATES) + ["전체"]:
+        W = S if world == "전체" else S[S.세계 == world]
         if not len(W): continue
+        _n = len(W) // max(1, len(plans))
         print("\n" + "=" * 112)
-        print(f"  [집계] {world} 세계 ({W.창시작연도.nunique()}창) — 팔별 중앙값")
+        print(f"  [집계] {'전체 격자' if world == '전체' else '종료일 ' + world} ({_n}조합) — 팔별 중앙값")
         print(f"    {'팔':<12}|{'눈금':>6}|{'CAGR 중앙':>11}|{'MDD 중앙':>11}|{'세금 중앙$':>14}|{'위기일 중앙':>12}")
         for nm in names:
             T = W[W.팔 == nm]
