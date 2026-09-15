@@ -1,70 +1,57 @@
-name: TQQQ/GLD Daily Bot
+# FAST 금리 액셀 실측 골자 — A 단독판 (코스톨라니 원리 적용) · 2026-09-15
 
-# ───────────────────────────────────────────────────────────
-#  실행 스케줄
-#   - cron은 UTC 기준. '0 22 * * *' = UTC 21:30 매일 = KST 06:30 매일
-#   - 뉴욕장 마감 후 전 거래일 종가 기준 지표 수집
-#   - workflow_dispatch: Actions 탭에서 수동 실행("Run workflow") 가능
-# ───────────────────────────────────────────────────────────
-on:
-  schedule:
-    - cron: '37 22 * * *'
-  workflow_dispatch:
+**작성**: Claude(감사역) / **재가**: 은박사님 2026-09-15 / **구현**: Gemini
+**소관**: FAST·VR 시스템 실험(켈리 연구 아님). 결과메모는 FAST 폴더.
+**성격**: 제로베이스 실측. 채택이든 기각이든 박제해 "금리 축" 문을 닫는다.
+**범위**: FAST 내부 비중 액셀(A)만. VR 매수한도 액셀(B)은 A 통과 시 후속 — 본 판 불포함.
 
-jobs:
-  run-bot:
-    runs-on: ubuntu-latest
-    timeout-minutes: 15
-    steps:
-      - name: 저장소 체크아웃
-        uses: actions/checkout@v4
+## 0. 무엇과 다른가
+2026-07-19 기각 = "금리 급변 → 즉시 대피"(브레이크: IRX 6M 변화 백분위 상위10% → VR 대피
+OR 결합, 2022 창 낙폭 −4.6%p 악화·수익 −5.8%p·헛대피 +5회). 본 실험 = "금리 방향 →
+연 1회 노출 조절"(액셀). 1987년처럼 인상 후에도 주가는 한동안 오르므로 즉시 대피는 원리로도
+헛대피 필연. 원리에 맞는 적용은 노출 크기이며 기록상 미시도.
 
-      - name: 파이썬 환경 설정
-        uses: actions/setup-python@v5
-        with:
-          python-version: '3.11'
+## 1. 팔 (다이얼 ARMS, 총액 $207,300)
+  ("FAST70+VR30", 0.50, 30, 0)   ← 현재 결정 예정 배치: FAST 70(금50:TQQQ50) : VR 30, 눈금 1.86
+  ("50:50 단독",   0.50,  0, 0)   ← FAST 액셀 단독 효과 분리용 대조군
+실행 2회: RATE_ACCEL="off" → "on". 창 격자 현행(시작 10 × 종료 6 → 유효 52창).
 
-      # ─── 캐시 복원/저장 (CSV 캐시 + last_report_date.txt 보존) ───
-      #  연휴로 캐시가 날아가도 봇은 전체 재계산해 현재 상태를 정확히 복원하므로
-      #  치명적이지 않음. 캐시는 속도·신호누락방지용 안전장치.
-      - name: 봇 캐시 복원
-        uses: actions/cache@v4
-        with:
-          path: ./bot_cache
-          key: bot-cache-${{ runner.os }}-${{ github.run_id }}
-          restore-keys: |
-            bot-cache-${{ runner.os }}-
+## 2. 금리 방향 판정 (사전 고정 — 결과 보고 바꾸지 말 것)
+- 소스: 3개월물 ^IRX(데이터 컬럼 IRX, 이미 존재). RATE_SRC="irx" 기본. 옵션 "fedfunds"(FRED).
+- 판정 시점: 매년 FAST 리밸런싱 신호일(12/31, 정본 타이밍). 연 1회만.
+- 방향: 판정일 최근 60거래일 IRX 평균 vs 12개월 전 같은 60거래일 평균.
+  차이 > +0.25%p → 상승기 / < −0.25%p → 하락기 / 사이 → 보합. (0.25%p = 연준 1회 폭. 튜닝 금지)
 
-      - name: 패키지 설치
-        run: |
-          python -m pip install --upgrade pip
-          pip install -r requirements.txt
+## 3. 액셀 규칙 (다음 1년 적용)
+- 상승기 → FAST 내부 TQQQ 비중 = 기본 − RATE_STEP(0.10): 50:50 → 40:60.
+- 하락기·보합 → 기본값 복귀. 한 단계만, 누적 하향 금지.
+- VR 슬리브·킬스위치·복귀 정책·세금·창 정의 전부 불변.
 
-      - name: 봇 스크립트 실행
-        env:
-          TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
-          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-          FRED_API_KEY: ${{ secrets.FRED_API_KEY }}
-          HEALTHCHECK_URL: ${{ secrets.HEALTHCHECK_URL }}
-          BOT_CACHE_DIR: ./bot_cache
-        run: |
-          mkdir -p ./bot_cache
-          python bot.py
+## 4. 수정 범위 (최소 수정)
+- 신설 상수: RATE_ACCEL="off", RATE_SRC="irx", RATE_STEP=0.10, RATE_THRESH=0.25, RATE_WIN=60
+- 접점 1곳: run_arm·run_r4의 FAST 연 리밸런싱 지점에서 다음 해 가중 w를 정할 때,
+  RATE_ACCEL="on"이면 §2 판정 → §3 적용. off일 때 기존과 바이트 동일 경로(회귀 조건).
+- 배너 1줄: RATE_ACCEL 상태·소스·문턱·창. 산출물 summary_rate_a_*.csv.
+- 표 진단 칼럼 2개: "상승기 판정 연수 / 하향 적용 연수"(창별). 로그에 판정 연도 목록 인쇄.
+- 기반: 칠판 현재 다이얼 격자판(구현자가 원본 md5·줄수 기재).
 
-      - name: 2008형 디버전스 알림 실행
-        if: always()
-        env:
-          FRED_API_KEY: ${{ secrets.FRED_API_KEY }}
-          FAST_TG_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
-          FAST_TG_CHAT: ${{ secrets.TELEGRAM_CHAT_ID }}
-        run: |
-          python fast_divergence_alert.py
+## 5. 검문소 (실험 제약 아님)
+- G-회귀: off 결과가 기존 동일 팔·창 결과와 소수점 일치(50:50 단독은 R9 csv와 대조 가능).
+- G-작동: 상승기 판정 연도가 실제 인상기(1994·1999~2000·2004~06·2015~18·2022)와 겹치는지,
+  하향 적용 연수 > 0인 창이 존재하는지 로그 확인.
+- 감사: diff→md5 재현, 함수 대조(변경 = 접점 1곳 + 상수 + 출력), 컴파일.
 
-      - name: 연말 점검 리마인더 (KST 12월 20일에만 발송)
-        if: always()
-        env:
-          FRED_API_KEY: ${{ secrets.FRED_API_KEY }}
-          FAST_TG_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
-          FAST_TG_CHAT: ${{ secrets.TELEGRAM_CHAT_ID }}
-        run: |
-          python fast_yearend_reminder.py
+## 6. 사전 등록 판정 기준
+- K1: 2010년 이후 창 — on의 낙폭이 off보다 얕은 창 ≥ 90%(26창 중 24 이상).
+- K2: 전체 52창 — 수익 훼손(on−off) 중앙 ≥ −0.5%p.
+- K3: 인상기 강세장 창(2003·2016 시작) — 수익 훼손 ≥ −1.0%p.
+- K1∧K2∧K3 통과 시에만 채택 논의(그때 B 후속 여부 결정). 하나라도 미달 → 기각·박제.
+
+## 7. 감사역 예측 (박제 — 결과와 대조)
+통과 확률 낮음. ①연 1회 판정의 사후성 — 2022형(1월 시작 인상)은 그해 12월까지 미반영
+②2004~06·2015~18 인상기 강세장에서 노출을 줄인 대가 ③버블지수(주가÷본원통화)가 이미
+코스톨라니의 '돈' 축을 구현해 금리는 같은 축의 중복 대리변수. 예측이 틀리면 그것이 소득.
+
+## 8. 납품
+수정본 전문 + 원본 대비 diff + 새 md5·줄수 칠판 게시 → 감사역 diff 재현·함수 대조·off 회귀
+확인 → 실행 승인 → off/on 로그 2본 + csv 2본 칠판 게시 → 판독·박제.
